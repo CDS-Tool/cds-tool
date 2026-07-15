@@ -22,6 +22,9 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "bin": {
+    "cds-tool": "./dist/cli.js"
+  },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -57,6 +60,50 @@
       {
         "command": "cdsTool.openApp",
         "title": "CDS Tool: Open App in Browser"
+      },
+      {
+        "command": "cdsTool.showWatchdog",
+        "title": "CDS Tool: Show App Watchdog"
+      },
+      {
+        "command": "cdsTool.syncOrg",
+        "title": "CDS Tool: Sync CF Landscape"
+      },
+      {
+        "command": "cdsTool.getToken",
+        "title": "CDS Tool: Get XSUAA Token"
+      },
+      {
+        "command": "cdsTool.restartApp",
+        "title": "CDS Tool: Restart CF App"
+      },
+      {
+        "command": "cdsTool.brunoSetup",
+        "title": "CDS Tool: Setup Bruno Collection"
+      },
+      {
+        "command": "cdsTool.brunoRun",
+        "title": "CDS Tool: Run Bruno Collection"
+      },
+      {
+        "command": "cdsTool.gitport",
+        "title": "CDS Tool: Port GitLab MR"
+      },
+      {
+        "command": "cdsTool.jiraSearch",
+        "title": "CDS Tool: Search Jira Issues"
+      },
+      {
+        "command": "cdsTool.sharepointRead",
+        "title": "CDS Tool: Read SharePoint Workbook"
+      },
+      {
+        "command": "cdsTool.smdgLogin",
+        "title": "CDS Tool: Smidge Login"
+      },
+      {
+        "command": "cdsTool.smdgGenerate",
+        "title": "CDS Tool: Generate Skill via Smidge"
       }
     ],
     "configuration": {
@@ -75,7 +122,8 @@
     "build": "node esbuild.mjs",
     "watch": "node esbuild.mjs --watch",
     "package": "vsce package --no-dependencies",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-specifier-resolution=node dist/test/unit.test.js || npx tsx src/test/unit.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

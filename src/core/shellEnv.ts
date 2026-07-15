@@ -39,6 +39,13 @@ export async function getCredentials(): Promise<{ email: string; password: strin
     return { email: shellEnv.SAP_EMAIL, password: shellEnv.SAP_PASSWORD }
   }
 
+  // Priority 3: VS Code SecretStorage (saved from previous login)
+  try {
+    const { loadEmail, loadPassword } = await import('../storage/store')
+    const [email, password] = await Promise.all([loadEmail(), loadPassword()])
+    if (email && password) return { email, password }
+  } catch { /* ignore */ }
+
   return { email: '', password: '' }
 }
 

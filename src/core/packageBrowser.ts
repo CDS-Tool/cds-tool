@@ -27,11 +27,11 @@ async function runRemote(appName: string, remoteCmd: string, org: string, space:
   }
 }
 
-export async function listRemotePackages(appName: string, org: string, space: string): Promise<string[]> {
-  const out = await runRemote(appName,
-    'find /home/vcap/app -name "package.json" -not -path "*/node_modules/*" -maxdepth 4 2>/dev/null | sort',
-    org, space
-  )
+export async function listRemotePackages(appName: string, org: string, space: string, filter?: string): Promise<string[]> {
+  const findCmd = filter
+    ? `find /home/vcap/app -name "package.json" -not -path "*/node_modules/*" -maxdepth 4 2>/dev/null | grep -i ${shellEscape(filter)} | sort`
+    : `find /home/vcap/app -name "package.json" -not -path "*/node_modules/*" -maxdepth 4 2>/dev/null | sort`
+  const out = await runRemote(appName, findCmd, org, space)
   return out.split('\n').map(l => l.trim()).filter(Boolean)
 }
 

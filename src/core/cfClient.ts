@@ -1,40 +1,10 @@
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { CfApp } from '../types'
+import { cf, getShell, shellCmd, shellEscape } from './cfShell'
 
 const execFileAsync = promisify(execFile)
 const MAX_BUF = 10 * 1024 * 1024
-
-function shellEscape(a: string): string {
-  return `'${a.replace(/'/g, "'\\''")}'`
-}
-
-function shellCmd(cmd: string, args: string[]): string {
-  return cmd + ' ' + args.map(shellEscape).join(' ')
-}
-
-function getShell(): string {
-  return process.env.SHELL || '/bin/zsh'
-}
-
-async function cf(args: string[], timeout = 60000): Promise<string> {
-  const shell = getShell()
-  const fullCmd = shellCmd('cf', args)
-  try {
-    const { stdout } = await execFileAsync(shell, ['-l', '-c', fullCmd], { maxBuffer: MAX_BUF, timeout })
-    return stdout as string
-  } catch (err: any) {
-    const stderr = err.stderr?.trim() ?? ''
-    throw new CfError(err.message, stderr)
-  }
-}
-
-export class CfError extends Error {
-  constructor(msg: string, public stderr: string) {
-    super(msg)
-    this.name = 'CfError'
-  }
-}
 
 export async function cfLogin(api: string, email: string, pw: string): Promise<void> {
   await cf(['api', api])
@@ -140,6 +110,48 @@ export async function cfCurrentTarget(): Promise<CfTargetInfo | null> {
 
 export async function cfLogout(): Promise<void> {
   await cf(['logout']).catch(() => {})
+}
+
+export async function checkCfCli(): Promise<{ found: boolean; version?: string }> {
+  const shell = getShell()
+  try {
+    const { stdout } = await execFileAsync(shell, ['-l', '-c', 'cf --version'], { maxBuffer: MAX_BUF, timeout: 10000 })
+    const version = (stdout as string).trim().split('\n')[0]?.trim()
+    return { found: true, version }
+  } catch {
+    return { found: false }
+  }
+}
+
+export async function checkCfSession(): Promise<{ ok: boolean; user?: string; org?: string; space?: string }> {
+  try {
+    const target = await cfCurrentTarget()
+    if (!target) return { ok: false }
+    return { ok: true, user: target.user, org: target.org, space: target.space }
+  } catch {
+    return { ok: false }
+  }
+}
+
+export async function cfAppGuid(app: string): Promise<string | null> {
+  try {
+    const out = await cf(['app', app, '--guid'])
+    return out.trim()
+  } catch {
+    return null
+  }
+}
+
+export async function cfServiceList(app: string): Promise<string[]> {
+  try {
+    const out = await cf(['services'])
+    const lines = out.split('\n')
+    const hdr = lines.findIndex(l => l.includes('name'))
+    if (hdr < 0) return []
+    return lines.slice(hdr + 1).map(l => l.trim().split(/\s+/)[0]).filter(Boolean)
+  } catch {
+    return []
+  }
 }
 
 export function parseVCAPServices(raw: string): Record<string, any> | null {

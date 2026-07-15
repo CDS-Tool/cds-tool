@@ -1,6 +1,6 @@
 import * as vscode from 'vscode'
 import type { WebviewMessage, ExtensionMessage } from '../types'
-import { saveConfig, loadConfig, clearConfig, saveEmail, loadFolderMappings, saveFolderMappings, setCachedApps, getCachedApps, loadCachedRegions } from '../storage/store'
+import { saveConfig, loadConfig, clearConfig, saveEmail, savePassword, loadFolderMappings, saveFolderMappings, setCachedApps, getCachedApps, loadCachedRegions } from '../storage/store'
 import { cfLogin, cfOrgs, cfTargetOrg, cfSpaces, cfApps, cfLogout } from '../core/cfClient'
 import { getCredentials } from '../core/shellEnv'
 import * as packageBrowser from '../core/packageBrowser'
@@ -22,9 +22,18 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
   private _disposables: vscode.Disposable[] = []
   private _credentialSource = ''
   private _log: (type: string, msg: string) => void
+  private _cfReady = false
+  private _debugPorts: Map<string, number> = new Map()
 
   constructor(logFn: (type: string, msg: string) => void) {
     this._log = logFn
+  }
+
+  setCfReady(ready: boolean): void {
+    this._cfReady = ready
+    if (this._view) {
+      post(this._view.webview, { type: 'CF_READY', payload: { ready } })
+    }
   }
 
   async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
@@ -51,6 +60,24 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
       post(view.webview, { type: 'LOGS_STATUS', payload: { appName: app, streaming } })
     logsManager.events.on('status', onLogStatus)
     this._disposables.push(new vscode.Disposable(() => logsManager.events.off('status', onLogStatus)))
+
+    const onTailLine = (app: string, line: string) =>
+      post(view.webview, { type: 'TAIL_LINE', payload: { appName: app, line } })
+    const { events: tailEvents } = await import('../core/cfTail')
+    tailEvents.on('line', onTailLine)
+    this._disposables.push(new vscode.Disposable(() => tailEvents.off('line', onTailLine)))
+
+    // Trace events
+    const onTraceLine = (app: string, trace: any) =>
+      post(view.webview, { type: 'TRACE_LINE', payload: { appName: app, line: JSON.stringify(trace) } })
+    const { events: traceEvents } = await import('../core/cfLiveTrace')
+    traceEvents.on('trace', onTraceLine)
+    this._disposables.push(new vscode.Disposable(() => traceEvents.off('trace', onTraceLine)))
+
+    const onTraceStatus = (app: string, active: boolean) =>
+      post(view.webview, { type: 'TRACE_STATUS', payload: { appName: app, active } })
+    traceEvents.on('status', onTraceStatus)
+    this._disposables.push(new vscode.Disposable(() => traceEvents.off('status', onTraceStatus)))
 
     // Auto-detect credentials and CF target
     const creds = await getCredentials()
@@ -93,6 +120,7 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
           }
           saveConfig(config)
           await saveEmail(email)
+          await savePassword(password)
           this._log('info', `Email saved to secret storage`)
           post(v.webview, { type: 'LOGIN_SUCCESS', payload: { orgs, apiEndpoint } })
         } catch (err: any) {
@@ -208,6 +236,9 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
       case 'RESET_LOGIN':
         clearConfig()
         await cfLogout()
+        const { clearSecrets } = await import('../storage/store')
+        await clearSecrets()
+        post(v.webview, { type: 'LOGOUT' })
         break
 
       case 'GENERATE_LAUNCH_CONFIG': {
@@ -246,6 +277,7 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
           payload: {
             remoteRoot: loadConfig()?.remoteRoot ?? '/home/vcap/app',
             sshUser: loadConfig()?.sshUser,
+            pkgRegexDefault: loadConfig()?.pkgRegexDefault,
             folderMappings: loadFolderMappings(),
           },
         })
@@ -257,6 +289,7 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
         }
         cfg.remoteRoot = msg.payload.remoteRoot
         cfg.sshUser = msg.payload.sshUser || undefined
+        if (msg.payload.pkgRegexDefault !== undefined) cfg.pkgRegexDefault = msg.payload.pkgRegexDefault || undefined
         if (msg.payload.newEndpoint) {
           cfg.knownEndpoints = cfg.knownEndpoints ?? []
           if (!cfg.knownEndpoints.includes(msg.payload.newEndpoint)) {
@@ -268,10 +301,139 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
         break
       }
 
+      case 'SAVE_MAPPING': {
+        try {
+          const { cfOrg, cfSpace, folderPath } = msg.payload
+          const mappings = loadFolderMappings()
+          const existing = mappings.findIndex(m => m.cfOrg === cfOrg && m.cfSpace === cfSpace)
+          const entry = { cfOrg, cfSpace, groupFolderPath: folderPath }
+          if (existing >= 0) mappings[existing] = entry
+          else mappings.push(entry)
+          saveFolderMappings(mappings)
+          this._log('ok', `Mapping saved: ${cfOrg}/${cfSpace} -> ${folderPath}`)
+        } catch (err: any) {
+          this._log('err', `Save mapping failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'BRUNO_RUN': {
+        try {
+          const { runBrunoCollection } = await import('../core/bruno')
+          const output = await runBrunoCollection(msg.payload.collectionPath, msg.payload.envVars)
+          post(v.webview, { type: 'BRUNO_RESULT', payload: { success: true, output } })
+        } catch (err: any) {
+          post(v.webview, { type: 'BRUNO_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'BRUNO_SETUP': {
+        try {
+          const { generateBrunoEnv, scaffoldBrunoCollection } = await import('../core/bruno')
+          const env = await generateBrunoEnv(msg.payload.appName, msg.payload.org, msg.payload.space)
+          const outDir = msg.payload.outputDir || (await import('node:os')).tmpdir()
+          const dir = scaffoldBrunoCollection(msg.payload.appName, env, outDir)
+          post(v.webview, { type: 'BRUNO_SETUP_RESULT', payload: { success: true, outputDir: dir } })
+        } catch (err: any) {
+          post(v.webview, { type: 'BRUNO_SETUP_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'GITPORT_CREATE': {
+        try {
+          const { portMr } = await import('../core/gitport')
+          const destRepo = msg.payload.destRepo
+          const mrUrl = await portMr(msg.payload.sourceMrUrl, destRepo, msg.payload.destBranch)
+          post(v.webview, { type: 'GITPORT_RESULT', payload: { success: true, mrUrl } })
+        } catch (err: any) {
+          post(v.webview, { type: 'GITPORT_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'JIRA_SEARCH': {
+        try {
+          const { searchIssues } = await import('../core/jira')
+          const issues = await searchIssues(msg.payload.jql, msg.payload.maxResults)
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: true, data: issues } })
+        } catch (err: any) {
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'JIRA_ISSUE': {
+        try {
+          const { getIssue } = await import('../core/jira')
+          const issue = await getIssue(msg.payload.issueKey)
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: true, data: issue } })
+        } catch (err: any) {
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'JIRA_TRANSITION': {
+        try {
+          const { transitionIssue } = await import('../core/jira')
+          await transitionIssue(msg.payload.issueKey, msg.payload.transitionId)
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: true } })
+        } catch (err: any) {
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'JIRA_COMMENT': {
+        try {
+          const { addComment } = await import('../core/jira')
+          await addComment(msg.payload.issueKey, msg.payload.comment)
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: true } })
+        } catch (err: any) {
+          post(v.webview, { type: 'JIRA_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SHAREPOINT_CREATE': {
+        try {
+          const { createWorkbook } = await import('../core/sharepoint')
+          await createWorkbook(msg.payload.siteId, msg.payload.drivePath, msg.payload.fileName, msg.payload.data)
+          post(v.webview, { type: 'SHAREPOINT_RESULT', payload: { success: true } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SHAREPOINT_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SHAREPOINT_READ': {
+        try {
+          const { readWorkbook } = await import('../core/sharepoint')
+          const data = await readWorkbook(msg.payload.siteId, msg.payload.drivePath, msg.payload.fileName)
+          post(v.webview, { type: 'SHAREPOINT_RESULT', payload: { success: true, data } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SHAREPOINT_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SHAREPOINT_APPEND': {
+        try {
+          const { appendToWorkbook } = await import('../core/sharepoint')
+          await appendToWorkbook(msg.payload.siteId, msg.payload.drivePath, msg.payload.fileName, msg.payload.data)
+          post(v.webview, { type: 'SHAREPOINT_RESULT', payload: { success: true } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SHAREPOINT_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
       case 'BROWSE_PACKAGES': {
         try {
-          const { appName, org, space } = msg.payload
-          const packages = await packageBrowser.listRemotePackages(appName, org, space)
+          const { appName, org, space, filter } = msg.payload
+          const packages = await packageBrowser.listRemotePackages(appName, org, space, filter)
           post(v.webview, {
             type: 'PACKAGES_LOADED',
             payload: { appName, packages, error: packages.length ? undefined : 'No packages found' },
@@ -373,6 +535,461 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
         }
         break
       }
+
+      case 'BROWSE_FOLDER': {
+        try {
+          const { org, space } = msg.payload
+          const folders = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, title: `Select local folder for org: ${org}` })
+          if (folders && folders.length > 0) {
+            const folderPath = folders[0].fsPath
+            const { saveFolderMappings, loadFolderMappings } = await import('../storage/store')
+            const mappings = loadFolderMappings()
+            const existingIdx = mappings.findIndex(m => m.cfOrg === org)
+            const mapping = { cfOrg: org, cfSpace: space ?? '', groupFolderPath: folderPath }
+            if (existingIdx >= 0) mappings[existingIdx] = mapping
+            else mappings.push(mapping)
+            saveFolderMappings(mappings)
+            this._log('ok', `Folder mapped: ${org} → ${folderPath}`)
+            post(v.webview, { type: 'CONFIG_LOADED', payload: {
+              config: (await import('../storage/store')).loadConfig(),
+              activeSessions: (await import('../core/debugManager')).getActiveSessions(),
+              folderMappings: loadFolderMappings(),
+            }})
+          }
+        } catch (err: any) {
+          this._log('err', `Folder browse error: ${err.message}`)
+        }
+        break
+      }
+
+      case 'RUN_SQL': {
+        try {
+          const { appName, org, space, sql } = msg.payload
+          const { executeSql } = await import('../core/cfHana')
+          const result = await executeSql(appName, org, space, sql, this._log)
+          post(v.webview, { type: 'SQL_RESULT', payload: { columns: result.columns, rows: result.rows } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SQL_RESULT', payload: { error: err.message } })
+        }
+        break
+      }
+
+      case 'START_TAIL': {
+        try {
+          const { appNames, org, space } = msg.payload
+          const { startTailSession } = await import('../core/cfTail')
+          startTailSession(appNames, org, space)
+          this._log('info', `Tail started for ${appNames.length} app(s)`)
+        } catch (err: any) {
+          this._log('err', `Tail error: ${err.message}`)
+        }
+        break
+      }
+
+      case 'STOP_TAIL': {
+        const { stopAllTailSessions } = await import('../core/cfTail')
+        stopAllTailSessions()
+        this._log('info', 'All tail sessions stopped')
+        break
+      }
+
+      case 'CHECK_CONNECTION': {
+        const { checkCfSession } = await import('../core/cfClient')
+        const health = await checkCfSession()
+        post(v.webview, { type: 'CONNECTION_HEALTH', payload: health })
+        break
+      }
+
+      case 'RESTART_APP': {
+        try {
+          const { appName, org, space } = msg.payload
+          const { cfTarget, cfRestart } = await import('../core/cfClient')
+          await cfTarget(org, space)
+          this._log('info', `Restarting ${appName}...`)
+          await cfRestart(appName)
+          this._log('ok', `${appName} restarted`)
+          post(v.webview, { type: 'APP_RESTARTED', payload: { appName } })
+        } catch (err: any) {
+          this._log('err', `Restart failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'LIST_SERVICES': {
+        try {
+          const { appName, org, space } = msg.payload
+          const { cfTarget, cfServiceList } = await import('../core/cfClient')
+          await cfTarget(org, space)
+          const services = await cfServiceList(appName)
+          post(v.webview, { type: 'SERVICES_LOADED', payload: { appName, services } })
+        } catch (err: any) {
+          this._log('err', `List services failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'GET_EVENTS': {
+        try {
+          const { appName, org, space } = msg.payload
+          const { cfTarget } = await import('../core/cfClient')
+          await cfTarget(org, space)
+          const { cfAppEvents } = await import('../core/cfEvents')
+          const events = await cfAppEvents(appName)
+          post(v.webview, { type: 'EVENTS_LOADED', payload: { appName, events } })
+        } catch (err: any) {
+          this._log('err', `Events fetch failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'GET_SPACE_EVENTS': {
+        try {
+          const { org, space } = msg.payload
+          const { cfTarget } = await import('../core/cfClient')
+          await cfTarget(org, space)
+          const { cfSpaceEvents } = await import('../core/cfEvents')
+          const events = await cfSpaceEvents()
+          post(v.webview, { type: 'EVENTS_LOADED', payload: { events } })
+        } catch (err: any) {
+          this._log('err', `Space events fetch failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'START_TRACE': {
+        try {
+          const { appName, org, space } = msg.payload
+          const { startTrace } = await import('../core/cfLiveTrace')
+          await startTrace(appName, org, space)
+          this._log('ok', `HTTP trace started for ${appName}`)
+        } catch (err: any) {
+          this._log('err', `Trace start failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'STOP_TRACE': {
+        const { stopAllTraces } = await import('../core/cfLiveTrace')
+        stopAllTraces()
+        this._log('info', 'All traces stopped')
+        break
+      }
+
+      case 'SET_BREAKPOINT': {
+        try {
+          const { appName, org, space, url, line, condition, logMessage } = msg.payload
+          const { setBreakpoint } = await import('../core/cfInspector')
+          const bpId = await setBreakpoint(appName, org, space, url, line, condition, logMessage)
+          this._log('ok', `Breakpoint set: ${url}:${line}`)
+        } catch (err: any) {
+          this._log('err', `Breakpoint failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'REMOVE_BREAKPOINT': {
+        try {
+          const { appName, breakpointId } = msg.payload
+          const { removeBreakpoint } = await import('../core/cfInspector')
+          await removeBreakpoint(appName, breakpointId)
+          this._log('ok', `Breakpoint ${breakpointId} removed`)
+        } catch (err: any) {
+          this._log('err', `Remove breakpoint failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'GET_STACK': {
+        try {
+          const { appName } = msg.payload
+          const { getStack } = await import('../core/cfInspector')
+          const stack = await getStack(appName)
+          post(v.webview, { type: 'STACK_CAPTURE', payload: { appName, stack } })
+        } catch (err: any) {
+          this._log('err', `Stack capture failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'LIST_BREAKPOINTS': {
+        try {
+          const { appName } = msg.payload
+          const { listBreakpoints } = await import('../core/cfInspector')
+          const bps = listBreakpoints(appName)
+          post(v.webview, { type: 'BREAKPOINT_LIST', payload: { appName, breakpoints: bps } })
+        } catch (err: any) {
+          this._log('err', `List breakpoints failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'RUN_QUERY': {
+        try {
+          const { appName, org, space, sql, params } = msg.payload
+          const { executeParametrizedQuery } = await import('../core/cfHana')
+          const result = await executeParametrizedQuery(appName, org, space, sql, params)
+          post(v.webview, { type: 'QUERY_RESULT', payload: { columns: result.columns, rows: result.rows } })
+        } catch (err: any) {
+          post(v.webview, { type: 'QUERY_RESULT', payload: { error: err.message } })
+        }
+        break
+      }
+
+      case 'BEGIN_TRANSACTION': {
+        try {
+          const { appName, org, space } = msg.payload
+          const { beginTransaction } = await import('../core/cfHana')
+          const sessionId = await beginTransaction(appName, org, space)
+          post(v.webview, { type: 'TRANSACTION_STARTED', payload: { sessionId } })
+          this._log('ok', `Transaction started: ${sessionId}`)
+        } catch (err: any) {
+          this._log('err', `Transaction start failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'COMMIT': {
+        try {
+          const { sessionId } = msg.payload
+          const { commit } = await import('../core/cfHana')
+          await commit(sessionId)
+          post(v.webview, { type: 'TRANSACTION_COMMITTED', payload: { sessionId } })
+          this._log('ok', `Transaction committed: ${sessionId}`)
+        } catch (err: any) {
+          this._log('err', `Commit failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'ROLLBACK': {
+        try {
+          const { sessionId } = msg.payload
+          const { rollback } = await import('../core/cfHana')
+          await rollback(sessionId)
+          post(v.webview, { type: 'TRANSACTION_ROLLED_BACK', payload: { sessionId } })
+          this._log('ok', `Transaction rolled back: ${sessionId}`)
+        } catch (err: any) {
+          this._log('err', `Rollback failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'QUERY_FILTER': {
+        try {
+          const { appName, query, level, source, tenant, status, since } = msg.payload
+          const { queryLogs } = await import('../core/logPipeline')
+          const lines = queryLogs(appName, { query, level, source, tenant, status, since })
+          post(v.webview, { type: 'QUERY_FILTERED', payload: { appName, lines } })
+        } catch (err: any) {
+          this._log('err', `Filter failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'DOWNLOAD_FILE': {
+        try {
+          const { appName, org, space, remotePath } = msg.payload
+          const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+          if (!ws) { this._log('warn', 'Open a workspace first'); break }
+          const { downloadFile } = await import('../core/cfFiles')
+          const result = await downloadFile(appName, org, space, remotePath, ws)
+          this._log('ok', `Downloaded ${result.path} (${result.size}b)`)
+          post(v.webview, { type: 'FILE_DOWNLOADED', payload: { appName, localPath: result.path, size: result.size } })
+        } catch (err: any) {
+          this._log('err', `Download failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'DOWNLOAD_FOLDER': {
+        try {
+          const { appName, org, space, remoteDir } = msg.payload
+          const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+          if (!ws) { this._log('warn', 'Open a workspace first'); break }
+          const { downloadFolder } = await import('../core/cfFiles')
+          const results = await downloadFolder(appName, org, space, remoteDir, ws)
+          this._log('ok', `Downloaded ${results.length} files from ${remoteDir}`)
+          post(v.webview, { type: 'FOLDER_DOWNLOADED', payload: { appName, files: results.length, localDir: ws } })
+        } catch (err: any) {
+          this._log('err', `Download folder failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'GEN_ENV': {
+        try {
+          const { appName, org, space } = msg.payload
+          const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+          if (!ws) { this._log('warn', 'Open a workspace first'); break }
+          const { genDefaultEnv } = await import('../core/cfFiles')
+          const localPath = genDefaultEnv(appName, org, space, ws)
+          this._log('ok', `default-env.json generated at ${localPath}`)
+          post(v.webview, { type: 'ENV_GENERATED', payload: { appName, localPath } })
+        } catch (err: any) {
+          this._log('err', `Gen env failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'SET_EXCEPTION_BP': {
+        try {
+          const { appName, org, space } = msg.payload
+          const { setExceptionBreakpoint } = await import('../core/cfInspector')
+          await setExceptionBreakpoint(appName, org, space)
+          this._log('ok', `Exception breakpoint set on ${appName}`)
+          post(v.webview, { type: 'EXCEPTION_BP_SET', payload: { appName } })
+        } catch (err: any) {
+          this._log('err', `Exception BP failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'REMOVE_EXCEPTION_BP': {
+        try {
+          const { appName } = msg.payload
+          const { removeExceptionBreakpoint } = await import('../core/cfInspector')
+          await removeExceptionBreakpoint(appName)
+          this._log('ok', `Exception breakpoint removed on ${appName}`)
+        } catch (err: any) {
+          this._log('err', `Remove exception BP failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'OPEN_DEVTOOLS': {
+        try {
+          const { appName, port } = msg.payload
+          const debugPort = port || (await import('../core/debugManager')).getDebugPort(appName)
+          if (!debugPort) { this._log('warn', `No active debug session for ${appName}`); break }
+          const devtoolsUrl = `devtools://devtools/bundled/inspector.html?ws=127.0.0.1:${debugPort}`
+          vscode.env.openExternal(vscode.Uri.parse(devtoolsUrl))
+          this._log('info', `DevTools opened for ${appName} on port ${debugPort}`)
+        } catch (err: any) {
+          this._log('err', `Open DevTools failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'CHANGE_DEBUG_PORT': {
+        try {
+          const { appName, port } = msg.payload
+          this._debugPorts.set(appName, port)
+          this._log('info', `Debug port for ${appName} set to ${port}`)
+          post(v.webview, { type: 'DEBUG_PORT_CHANGED', payload: { appName, port } })
+        } catch (err: any) {
+          this._log('err', `Change port failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'GEN_SKILL': {
+        try {
+          const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || (await import('node:os')).homedir()
+          const { generateAgentSkill, checkSmdgCli } = await import('../core/agentSkill')
+          const smdgAvailable = checkSmdgCli()
+          if (smdgAvailable && msg.payload?.useSmdg) {
+            const { smdgGenerate } = await import('../core/agentSkill')
+            const { existsSync } = await import('node:fs')
+            const sources = [`${ws}/README.md`, `${ws}/package.json`].filter(existsSync)
+            const result = await smdgGenerate(sources, 'cds-tool-cap-debugger', 'coding')
+            if (result.success) {
+              this._log('ok', `Smidge skill generated: ${result.skillPath}`)
+              post(v.webview, { type: 'SMDG_SKILL_GENERATED', payload: { skillPath: result.skillPath, output: result.output } })
+            } else {
+              this._log('warn', `Smidge generation failed, using fallback: ${result.error}`)
+              const skillPath = generateAgentSkill(ws, { name: 'cds-tool-cap-debugger', version: '1.0.0' })
+              post(v.webview, { type: 'SKILL_GENERATED', payload: { localPath: skillPath } })
+            }
+          } else {
+            const skillPath = generateAgentSkill(ws, { name: 'cds-tool-cap-debugger', version: '1.0.0' })
+            this._log('ok', `AI agent skill generated at ${skillPath}`)
+            post(v.webview, { type: 'SKILL_GENERATED', payload: { localPath: skillPath } })
+          }
+        } catch (err: any) {
+          this._log('err', `Skill generation failed: ${err.message}`)
+        }
+        break
+      }
+
+      case 'SMDG_CHECK': {
+        try {
+          const { checkSmdgCli } = await import('../core/agentSkill')
+          post(v.webview, { type: 'SMDG_STATUS', payload: { available: checkSmdgCli() } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SMDG_STATUS', payload: { available: false } })
+        }
+        break
+      }
+
+      case 'SMDG_LOGIN': {
+        try {
+          const { smdgLogin } = await import('../core/agentSkill')
+          const result = await smdgLogin()
+          post(v.webview, { type: 'SMDG_RESULT', payload: result })
+        } catch (err: any) {
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SMDG_LOGOUT': {
+        try {
+          const { smdgLogout } = await import('../core/agentSkill')
+          const result = smdgLogout()
+          post(v.webview, { type: 'SMDG_RESULT', payload: result })
+        } catch (err: any) {
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SMDG_GENERATE': {
+        try {
+          const { smdgGenerate } = await import('../core/agentSkill')
+          const result = await smdgGenerate(msg.payload.sources, msg.payload.name, msg.payload.category, msg.payload.install)
+          if (result.success) {
+            post(v.webview, { type: 'SMDG_SKILL_GENERATED', payload: { skillPath: result.skillPath, output: result.output } })
+          } else {
+            post(v.webview, { type: 'SMDG_RESULT', payload: result })
+          }
+        } catch (err: any) {
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SMDG_INSTALL': {
+        try {
+          const { smdgInstall } = await import('../core/agentSkill')
+          const result = smdgInstall(msg.payload.skillName, msg.payload.platform)
+          post(v.webview, { type: 'SMDG_RESULT', payload: result })
+        } catch (err: any) {
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SMDG_CREDITS': {
+        try {
+          const { smdgCredits } = await import('../core/agentSkill')
+          const credits = smdgCredits()
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: true, output: credits } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
+
+      case 'SMDG_LIST': {
+        try {
+          const { smdgListSkills } = await import('../core/agentSkill')
+          const skills = smdgListSkills()
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: true, output: skills } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SMDG_RESULT', payload: { success: false, error: err.message } })
+        }
+        break
+      }
     }
   }
 
@@ -380,94 +997,115 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
     return `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
-:root{--bg:#1e1e1e;--fg:#d4d4d4;--border:#3c3c3c;--accent:#0078d4;--accent-hover:#1a8ae8;--success:#4caf50;--error:#f44747;--warn:#ff8c00;--card:#252526;--card-hover:#2a2d2e;--input-bg:#3c3c3c;--text-muted:#858585;--radius:6px}
+:root{--bg:#0d1117;--fg:#e6edf3;--border:#30363d;--accent:#2d9bf0;--accent-hover:#58a6ff;--success:#3fb950;--error:#f85149;--warn:#d29922;--card:#161b22;--card-hover:#1c2128;--card-alt:#0d1117;--input-bg:#0d1117;--text-muted:#8b949e;--radius:10px;--shadow:0 4px 20px rgba(0,0,0,.4)}
 *{box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:12px;color:var(--fg);background:var(--bg);font-size:13px;margin:0;line-height:1.5}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif;padding:14px;color:var(--fg);background:var(--bg);font-size:13px;margin:0;line-height:1.6;overflow-x:hidden;-webkit-font-smoothing:antialiased}
 .hidden{display:none!important}
-.section{margin-bottom:16px}
-h3{margin:10px 0 8px;font-size:11.5px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.8px}
-label{display:block;margin:6px 0 3px;font-size:11px;color:var(--text-muted);font-weight:500}
-input,select,button{width:100%;box-sizing:border-box;margin:3px 0;padding:6px 10px;font-size:12.5px}
-input,select{background:var(--input-bg);border:1px solid var(--border);color:var(--fg);border-radius:var(--radius);transition:border-color .15s}
-input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
-input::placeholder{color:var(--text-muted)}
-button{background:var(--accent);color:#fff;border:none;padding:7px 14px;cursor:pointer;border-radius:var(--radius);font-weight:500;transition:all .12s;display:inline-flex;align-items:center;justify-content:center;gap:6px}
-button:hover{background:var(--accent-hover);box-shadow:0 1px 3px rgba(0,0,0,.3)}
-button:active{transform:scale(.97)}
-button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
-.btn-danger{background:#c73e3e}
-.btn-danger:hover{background:var(--error)}
-.btn-success{background:#388e3c}
-.btn-success:hover{background:var(--success)}
-.btn-small{padding:4px 10px;font-size:11px;width:auto;border-radius:4px;font-weight:500}
+.section{animation:fadeSlide .2s ease;margin-bottom:16px}
+@keyframes fadeSlide{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes slideDown{from{opacity:0;max-height:0}to{opacity:1;max-height:400px}}
+h3{margin:10px 0 8px;font-size:11px;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:1.2px;display:flex;align-items:center;gap:6px}
+h3::before{content:'';display:inline-block;width:3px;height:14px;background:linear-gradient(180deg,var(--accent),#1f6feb);border-radius:3px}
+label{display:block;margin:8px 0 4px;font-size:11px;color:var(--text-muted);font-weight:600;letter-spacing:.3px}
+input,select,textarea{width:100%;box-sizing:border-box;margin:3px 0;padding:8px 12px;font-size:12.5px}
+input,select,textarea{background:var(--input-bg);border:1px solid var(--border);color:var(--fg);border-radius:var(--radius);transition:all .2s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(45,155,240,.15)}
+input::placeholder,textarea::placeholder{color:var(--text-muted);opacity:.5}
+textarea{resize:vertical;min-height:60px;font-family:'SF Mono','SFMono-Regular','Menlo',monospace;font-size:11px;line-height:1.5}
+button{background:linear-gradient(180deg,#238636,#196c2e);color:#fff;border:none;padding:8px 16px;cursor:pointer;border-radius:var(--radius);font-weight:600;transition:all .15s;display:inline-flex;align-items:center;justify-content:center;gap:7px;font-size:12.5px}
+button:hover{background:linear-gradient(180deg,#2ea043,#238636);transform:translateY(-1px);box-shadow:0 3px 10px rgba(35,134,54,.3)}
+button:active{transform:translateY(0)}
+button:disabled{opacity:.3;cursor:default;transform:none;box-shadow:none}
+.btn-primary{background:linear-gradient(180deg,var(--accent),#1f6feb)}
+.btn-primary:hover{background:linear-gradient(180deg,#58a6ff,var(--accent));box-shadow:0 3px 10px rgba(45,155,240,.3)}
+.btn-danger{background:linear-gradient(180deg,#da3633,#b62324)}
+.btn-danger:hover{background:linear-gradient(180deg,#f85149,#da3633);box-shadow:0 3px 10px rgba(248,81,73,.3)}
+.btn-success{background:linear-gradient(180deg,#238636,#196c2e)}
+.btn-small{padding:5px 12px;font-size:11px;width:auto;border-radius:6px;font-weight:600}
 .btn-outline{background:transparent;border:1px solid var(--border);color:var(--fg)}
-.btn-outline:hover{background:var(--card-hover);border-color:var(--text-muted);box-shadow:none}
-.btn-icon{padding:4px;width:auto;background:transparent;color:var(--text-muted)}
-.btn-icon:hover{background:var(--card-hover);color:var(--fg);box-shadow:none}
-.row{display:flex;gap:6px;align-items:center}
-.row button{flex:1}
-.app-item{display:flex;align-items:center;gap:8px;padding:6px 8px;transition:background .1s;border-radius:4px}
+.btn-outline:hover{background:var(--card-hover);border-color:var(--text-muted);transform:none;box-shadow:none}
+.btn-ghost{background:transparent;color:var(--text-muted);padding:4px 8px;width:auto}
+.btn-ghost:hover{background:var(--card-hover);color:var(--fg);transform:none;box-shadow:none}
+.row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.row button{flex:1;min-width:60px}
+.app-item{display:flex;align-items:center;gap:10px;padding:7px 10px;transition:all .12s;border-radius:6px;margin:2px 0}
 .app-item:hover{background:var(--card-hover)}
-.app-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;font-size:12.5px}
-.app-item .cb-wrap{display:flex;align-items:center}
-.app-check{width:auto;margin:0;accent-color:var(--accent);cursor:pointer}
-.state-started{color:var(--success);font-size:11px;font-weight:500;background:rgba(76,175,80,.12);padding:1px 6px;border-radius:3px}
-.state-stopped{color:var(--text-muted);font-size:11px;background:rgba(133,133,133,.1);padding:1px 6px;border-radius:3px}
-.state-empty{color:var(--warn);font-size:11px;background:rgba(255,140,0,.12);padding:1px 6px;border-radius:3px}
-.badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--input-bg);cursor:pointer;transition:all .12s}
-.badge:hover{background:var(--accent);color:#fff}
-.log-line{font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid rgba(255,255,255,.04);padding:2px 0;transition:background .1s}
-.log-line:hover{background:rgba(255,255,255,.03)}
-.log-container{max-height:300px;overflow-y:auto;background:#0d0d0d;padding:6px;border-radius:var(--radius);font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;border:1px solid var(--border)}
-.session-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:6px;transition:all .12s}
-.session-card:hover{border-color:var(--text-muted)}
-.session-card .top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.session-card .name{font-size:12.5px;font-weight:600;flex:1}
-.session-card .badge-status{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:500}
-.session-card .badge-ATTACHED{background:var(--success);color:#fff}
-.session-card .badge-CONNECTING{background:var(--accent);color:#fff}
-.session-card .badge-TUNNELING{background:var(--warn);color:#000}
-.session-card .badge-SIGNALING{background:var(--warn);color:#000}
-.session-card .badge-ERROR{background:var(--error);color:#fff}
-.session-card .badge-PENDING{background:var(--text-muted);color:#fff}
-.session-card .details{font-size:11px;color:var(--text-muted);padding:4px 0}
-.session-card .actions{display:flex;gap:4px;margin-top:6px}
-.status-ATTACHED{color:var(--success);font-size:11px;font-weight:500;display:none}
-.status-TUNNELING{color:var(--warn);font-size:11px;display:none}
-.status-SIGNALING{color:var(--warn);font-size:11px;display:none}
-.status-ERROR{color:var(--error);font-size:11px;display:none}
-.status-PENDING{color:var(--text-muted);font-size:11px;display:none}
-.status-CONNECTING{color:var(--accent);font-size:11px;display:none}
-.tab-bar{display:flex;gap:1px;margin-bottom:12px;position:sticky;top:0;background:var(--bg);z-index:1;padding:6px 0 0;border-bottom:1px solid var(--border)}
-.tab-bar button{flex:1;background:transparent;color:var(--text-muted);font-size:11.5px;padding:6px 4px;border-radius:0;border-bottom:2px solid transparent;margin:0;transition:all .15s;font-weight:400}
-.tab-bar button:hover{background:transparent;color:var(--fg)}
-.tab-bar button.active{background:transparent;color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
-.server-info{font-size:11.5px;color:var(--text-muted);padding:8px 10px;background:var(--card);border-radius:var(--radius);margin:6px 0;word-break:break-all;border:1px solid var(--border)}
-.pill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:10px;margin:2px 0;font-weight:500}
-.pill-env{background:var(--success);color:#fff}
+.app-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;font-size:12.5px;font-weight:500}
+.app-check{width:auto;margin:0;accent-color:var(--accent);cursor:pointer;transform:scale(1.1)}
+.state-started{color:var(--success);font-size:10.5px;font-weight:600;display:flex;align-items:center;gap:5px}
+.state-started::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--success);animation:pulse 2s infinite;display:inline-block}
+.state-stopped{color:var(--text-muted);font-size:10.5px}
+.state-empty{color:var(--warn);font-size:10.5px}
+.badge{display:inline-flex;align-items:center;font-size:9.5px;padding:2px 8px;background:linear-gradient(180deg,var(--accent),#1f6feb);color:#fff;border-radius:10px;cursor:pointer;transition:all .12s;font-weight:600;text-decoration:none}
+.badge:hover{transform:translateY(-1px);box-shadow:0 2px 8px rgba(45,155,240,.25)}
+.pill{display:inline-flex;align-items:center;font-size:9px;padding:2px 8px;border-radius:8px;font-weight:700;letter-spacing:.3px;text-transform:uppercase}
+.pill-env{background:linear-gradient(180deg,#238636,#196c2e);color:#fff}
 .pill-none{background:var(--text-muted);color:#fff}
-.pill-srv{background:#0078d4;color:#fff}
-.pill-db{background:#7c4dff;color:#fff}
-.pill-ui{background:#ff8c00;color:#fff}
-.pill-router{background:#00bcd4;color:#fff}
-.pill-job{background:#607d8b;color:#fff}
-.filter-input{margin:4px 0}
-.section-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:10px}
-#loadingOverlay{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+.pill-srv{background:linear-gradient(180deg,#1f6feb,#0d419d);color:#fff}
+.pill-db{background:linear-gradient(180deg,#8957e5,#512a97);color:#fff}
+.pill-ui{background:linear-gradient(180deg,#d29922,#9e6a03);color:#fff}
+.pill-router{background:linear-gradient(180deg,#1f6feb,#0d419d);color:#fff}
+.pill-job{background:linear-gradient(180deg,#8b949e,#484f58);color:#fff}
+.filter-input{margin:4px 0;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:7px 12px;font-size:12px;color:var(--fg);width:100%;transition:all .2s}
+.filter-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(45,155,240,.15)}
+.section-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px;margin-bottom:10px;transition:all .2s}
+.section-card:hover{border-color:rgba(45,155,240,.15)}
+#loadingOverlay{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
 #loadingOverlay.hidden{display:none}
-.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block;flex-shrink:0}
+.spinner{width:18px;height:18px;border:2.5px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
-.loading-text{font-size:13px;color:var(--text-muted)}
-.project-group{margin-bottom:4px}
-.project-header{display:flex;align-items:center;gap:6px;padding:5px 6px;cursor:pointer;border-radius:4px;transition:background .1s;font-size:12px;font-weight:600;color:var(--fg);user-select:none}
+.loading-text{font-size:13px;color:var(--text-muted);font-weight:500}
+.project-group{margin-bottom:6px}
+.project-header{display:flex;align-items:center;gap:8px;padding:6px 8px;cursor:pointer;border-radius:6px;transition:all .12s;font-size:12px;font-weight:700;color:var(--fg);user-select:none}
 .project-header:hover{background:var(--card-hover)}
-.project-header .arrow{font-size:8px;transition:transform .15s;color:var(--text-muted)}
+.project-header .arrow{font-size:7px;transition:transform .2s;color:var(--text-muted)}
 .project-header .arrow.collapsed{transform:rotate(-90deg)}
-.project-header .count{font-size:10px;color:var(--text-muted);font-weight:400;margin-left:auto}
-.project-children{border-left:1px solid var(--border);margin-left:10px;padding-left:6px}
+.project-header .count{font-size:10px;color:var(--text-muted);font-weight:500;margin-left:auto;background:var(--input-bg);padding:1px 8px;border-radius:8px}
+.project-children{border-left:2px solid var(--border);margin-left:12px;padding-left:8px;animation:slideDown .2s ease}
 .inline-spinner{display:inline-flex;align-items:center;gap:6px;color:var(--text-muted);font-size:12px}
-.db-table td:first-child{font-weight:500}
-.db-table td:last-child{font-family:monospace;font-size:11px}
+.tab-bar{display:flex;gap:3px;margin-bottom:12px;background:var(--card);border-radius:var(--radius);border:1px solid var(--border);padding:3px}
+.tab-bar button{background:transparent;color:var(--text-muted);border:none;padding:7px 10px;font-size:11px;cursor:pointer;font-weight:600;transition:all .2s;border-radius:7px;flex:1;text-align:center}
+.tab-bar button.active{color:#fff;background:linear-gradient(180deg,var(--accent),#1f6feb);box-shadow:0 2px 8px rgba(45,155,240,.25)}
+.tab-bar button:hover:not(.active){color:var(--fg);background:var(--card-hover)}
+.log-container{background:var(--input-bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px;height:280px;overflow-y:auto;font-family:'SF Mono','SFMono-Regular','Menlo',monospace;font-size:10.5px;line-height:1.7}
+.log-line{white-space:pre-wrap;word-break:break-all;color:var(--fg);padding:2px 6px;border-radius:3px}
+.log-line:nth-child(odd){background:rgba(255,255,255,.02)}
+.log-line:hover{background:rgba(45,155,240,.06)}
+.server-info{font-size:11.5px;color:var(--text-muted);padding:10px 12px;background:var(--input-bg);border-radius:var(--radius);margin:6px 0;word-break:break-all;border:1px solid var(--border);line-height:1.6}
+.session-card{background:var(--input-bg);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin:4px 0;display:flex;align-items:center;gap:10px;transition:all .15s}
+.session-card:hover{border-color:rgba(45,155,240,.15)}
+.status-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;display:inline-block}
+.status-ATTACHED{background:var(--success);animation:pulse 2s infinite;box-shadow:0 0 6px rgba(63,185,80,.5)}
+.status-CONNECTING{background:var(--warn);animation:pulse 1s infinite}
+.status-TUNNELING{background:var(--accent);animation:pulse 1.5s infinite}
+.status-ERROR{background:var(--error)}
+.status-SIGNALING{background:var(--warn);animation:pulse 1s infinite}
+.status-EXITED{background:var(--text-muted)}
+.session-card .session-name{flex:1;font-weight:600;font-size:12px}
+.session-card .session-status{font-size:10px;color:var(--text-muted);font-weight:600;letter-spacing:.5px}
+.region-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px}
+.region-btn{font-size:10px;padding:5px 8px;text-align:left;border:1px solid var(--border);background:var(--card);border-radius:6px;cursor:pointer;transition:all .12s;font-weight:500;color:var(--text-muted)}
+.region-btn:hover{background:var(--card-hover);color:var(--fg);border-color:var(--accent)}
+.region-btn.active{border-color:var(--accent);background:rgba(45,155,240,.1);color:var(--accent);font-weight:600}
+.db-table{width:100%;border-collapse:collapse;font-size:11.5px}
+.db-table td{padding:6px 8px;border-bottom:1px solid var(--border)}
+.db-table td:first-child{font-weight:600;color:var(--text-muted);white-space:nowrap}
+.db-table td:last-child{font-family:'SF Mono','SFMono-Regular','Menlo',monospace;font-size:10.5px;word-break:break-all}
+.sql-table-wrap{overflow-x:auto;margin-top:8px;border:1px solid var(--border);border-radius:8px}
+.sql-table{width:100%;border-collapse:collapse;font-size:10.5px;min-width:400px}
+.sql-table th,.sql-table td{padding:5px 8px;border:1px solid var(--border);text-align:left;white-space:nowrap}
+.sql-table th{background:var(--card);color:var(--text-muted);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0}
+.sql-table tr:nth-child(even){background:rgba(255,255,255,.015)}
+.sql-table tr:hover{background:rgba(45,155,240,.05)}
+.tail-line{font-family:'SF Mono','SFMono-Regular','Menlo',monospace;font-size:10px;line-height:1.5;padding:1px 6px;border-radius:2px;white-space:pre-wrap;word-break:break-all}
+.tail-line .app-tag{display:inline-block;font-size:8px;padding:1px 6px;border-radius:4px;margin-right:4px;font-weight:600}
+.toast-container{position:fixed;bottom:12px;right:12px;z-index:99999;display:flex;flex-direction:column;gap:6px;max-width:320px}
+.toast{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:11.5px;color:var(--fg);box-shadow:0 4px 16px rgba(0,0,0,.5);animation:slideIn .25s ease;display:flex;align-items:center;gap:8px;cursor:pointer;border-left:3px solid var(--accent)}
+.toast.error{border-left-color:var(--error)}
+.toast.success{border-left-color:var(--success)}
+.toast.warn{border-left-color:var(--warn)}
+@keyframes slideIn{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:translateX(0)}}
 </style>
 </head><body>
 <div id="loadingOverlay"><div class="spinner"></div><div class="loading-text">Loading CDS Tool...</div></div>
@@ -478,6 +1116,7 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
   <button data-tab="debug">Debug</button>
   <button data-tab="logs">Logs</button>
   <button data-tab="db">DB</button>
+  <button data-tab="tools">Tools</button>
   <button data-tab="settings">&#9881;</button>
 </div>
 
@@ -503,6 +1142,11 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
       <button id="btnLogout" class="btn-danger btn-small">Logout</button>
     </div>
     <div id="loginStatus" class="server-info" style="margin-top:8px">Waiting for login...</div>
+    <div id="cfStatus" class="server-info" style="margin-top:4px;font-size:11px"></div>
+    <div id="connectionStatus" class="server-info" style="margin-top:2px;font-size:11px"></div>
+    <div class="row" style="margin-top:4px;gap:4px">
+      <button id="btnCheckConnection" class="btn-small btn-outline">Check Connection</button>
+    </div>
   </div>
 </div>
 
@@ -511,7 +1155,11 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <h3>Organization &amp; Space</h3>
     <select id="orgSelect"><option value="">Select org...</option></select>
     <select id="spaceSelect"><option value="">Select space...</option></select>
-    <button id="btnRefreshApps" style="margin-top:6px">Refresh Apps</button>
+    <div class="row" style="margin-top:6px">
+      <button id="btnRefreshApps" class="btn-small btn-outline">Refresh Apps</button>
+      <button id="btnBrowseFolder" class="btn-small btn-outline" title="Select local workspace folder for this org">Browse Folder</button>
+    </div>
+    <div id="folderMappingInfo" class="server-info hidden" style="font-size:10px;margin-top:4px"></div>
     <input id="appFilter" class="filter-input" placeholder="Filter apps...">
   </div>
   <div class="section-card">
@@ -540,6 +1188,18 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <div id="watchdogStatus" class="server-info">No apps watched</div>
     <button id="btnShowWatchdog" class="btn-small btn-outline">Show Watchdog</button>
   </div>
+  <div class="section-card">
+    <h3>HTTP Trace (cf-live-trace)</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Monkey-patches <code>http.createServer</code> via CDP to capture request/response traces.</p>
+    <select id="traceAppSelect"><option value="">Select app...</option></select>
+    <div class="row">
+      <button id="btnStartTrace" class="btn-small btn-success">Start Trace</button>
+      <button id="btnStopTrace" class="btn-small btn-danger">Stop Trace</button>
+      <button id="btnClearTrace" class="btn-small btn-outline">Clear</button>
+    </div>
+    <div id="traceStatus" class="server-info hidden" style="font-size:10px"></div>
+    <div id="traceContainer" class="log-container" style="max-height:200px;font-size:9.5px;margin-top:6px"></div>
+  </div>
 </div>
 
 <div id="tab-logs" class="section hidden">
@@ -547,13 +1207,40 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <h3>Log Streaming</h3>
     <select id="logAppSelect"><option value="">Select app...</option></select>
     <div class="row">
-      <button id="btnStartLogs">Start</button>
-      <button id="btnStopLogs" class="btn-danger btn-small">Stop</button>
-      <button id="btnClearLogs" class="btn-small">Clear</button>
+      <button id="btnStartLogs" class="btn-small btn-success">Start</button>
+      <button id="btnStopLogs" class="btn-small btn-danger">Stop</button>
+      <button id="btnClearLogs" class="btn-small btn-outline">Clear</button>
+    </div>
+    <div id="logFilters" style="margin-top:6px;padding:6px;background:var(--card);border:1px solid var(--border);border-radius:6px">
+      <div class="row" style="gap:4px;flex-wrap:wrap">
+        <select id="logLevelFilter" style="flex:1;min-width:70px">
+          <option value="">All levels</option>
+          <option value="error">Error</option>
+          <option value="warn">Warn</option>
+          <option value="info">Info</option>
+          <option value="debug">Debug</option>
+        </select>
+        <input id="logSourceFilter" placeholder="Source" style="flex:1;min-width:80px">
+        <input id="logTenantFilter" placeholder="Tenant" style="flex:1;min-width:80px">
+        <input id="logStatusFilter" placeholder="Status" style="flex:1;min-width:80px">
+      </div>
+      <div class="row" style="gap:4px;margin-top:4px">
+        <input id="logSinceFilter" type="datetime-local" style="flex:1">
+        <button id="btnApplyLogFilter" class="btn-small btn-outline" style="flex-shrink:0">Filter</button>
+        <button id="btnClearLogFilter" class="btn-small" style="flex-shrink:0">Clear</button>
+      </div>
     </div>
   </div>
   <div class="section-card">
     <div id="logContainer" class="log-container"></div>
+  </div>
+  <div class="section-card">
+    <h3>Multi-App Log Tail</h3>
+    <p style="font-size:10.5px;color:var(--text-muted);margin-bottom:6px">Stream logs from multiple selected apps simultaneously.</p>
+    <button id="btnStartTail" class="btn-small btn-success">Start Tail All</button>
+    <button id="btnStopTail" class="btn-small btn-danger">Stop Tail</button>
+    <div id="tailContainer" class="log-container" style="max-height:200px;font-size:9.5px;margin-top:6px"></div>
+    <div id="tailStatus" class="server-info hidden" style="font-size:10px"></div>
   </div>
 </div>
 
@@ -561,9 +1248,20 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
   <div class="section-card">
     <h3>HANA Database</h3>
     <select id="dbAppSelect"><option value="">Select app...</option></select>
-    <button id="btnGetDbCreds">Get DB Credentials</button>
+    <div class="row">
+      <button id="btnGetDbCreds">Get Credentials</button>
+      <button id="btnListTables" class="btn-small btn-outline">List Tables</button>
+    </div>
     <div id="dbInfo" class="server-info hidden"></div>
     <button id="btnAddDb" class="btn-success hidden">Add SQLTools Connection</button>
+    <div id="sqlQueryArea" class="hidden" style="margin-top:8px">
+      <textarea id="sqlInput" placeholder="SELECT * FROM TABLES" rows="3"></textarea>
+      <div class="row">
+        <button id="btnRunSql" class="btn-small btn-success">Run SQL</button>
+        <button id="btnClearSql" class="btn-small btn-outline">Clear</button>
+      </div>
+      <div id="sqlResult"></div>
+    </div>
   </div>
   <div class="section-card">
     <h3>XSUAA Token</h3>
@@ -577,7 +1275,7 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <div class="row" style="gap:4px">
       <input id="pkgRegexFilter" class="filter-input" placeholder="Filter by regex (e.g. @sap/)" style="flex:1">
     </div>
-    <button id="btnBrowsePkg">Browse package.json files</button>
+    <button id="btnBrowsePkg">Browse package.json</button>
     <div id="pkgList" class="server-info hidden"></div>
   </div>
   <div class="section-card">
@@ -585,12 +1283,12 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <select id="explorerAppSelect"><option value="">Select app...</option></select>
     <div class="row" style="gap:4px">
       <input id="explorerPath" value="/home/vcap/app" style="flex:1;font-size:11px">
-      <button id="btnLsRemote" class="btn-small">ls</button>
-      <button id="btnFindRemote" class="btn-small">Find</button>
+      <button id="btnLsRemote" class="btn-small btn-outline">ls</button>
+      <button id="btnFindRemote" class="btn-small btn-outline">Find</button>
     </div>
     <div class="row" style="gap:4px;margin-top:4px">
       <input id="explorerQuery" placeholder="Grep query..." style="flex:1;font-size:11px">
-      <button id="btnGrepRemote" class="btn-small">Grep</button>
+      <button id="btnGrepRemote" class="btn-small btn-primary">Grep</button>
     </div>
     <div id="explorerOutput" class="server-info hidden"></div>
   </div>
@@ -621,6 +1319,97 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <h3>Cache</h3>
     <div id="cacheInfo" class="server-info">No cached data</div>
     <button id="btnClearCache" class="btn-small btn-danger">Clear Cache</button>
+  </div>
+</div>
+
+<div id="tab-tools" class="section hidden">
+  <div class="section-card">
+    <h3>File Operations</h3>
+    <select id="toolsAppSelect"><option value="">Select app...</option></select>
+    <label>Remote path</label>
+    <input id="toolsRemotePath" placeholder="/home/vcap/app/package.json">
+    <div class="row" style="gap:4px">
+      <button id="btnDownloadFile" class="btn-small btn-success">Download File</button>
+      <button id="btnDownloadFolder" class="btn-small btn-outline">Download Folder</button>
+      <button id="btnGenEnv" class="btn-small btn-outline">Gen default-env.json</button>
+    </div>
+    <div id="downloadStatus" class="server-info hidden" style="margin-top:6px"></div>
+  </div>
+  <div class="section-card">
+    <h3>Inspector &amp; DevTools</h3>
+    <select id="inspectorAppSelect"><option value="">Select app...</option></select>
+    <div class="row" style="gap:4px">
+      <button id="btnOpenDevTools" class="btn-small">Open Chrome DevTools</button>
+      <button id="btnSetExceptionBp" class="btn-small btn-outline">Exception BP</button>
+      <button id="btnListBp" class="btn-small btn-outline">List BPs</button>
+    </div>
+    <div id="inspectorStatus" class="server-info hidden" style="margin-top:6px"></div>
+  </div>
+  <div class="section-card">
+    <h3>Events &amp; Activity</h3>
+    <select id="eventsAppSelect"><option value="">Select app...</option></select>
+    <div class="row" style="gap:4px">
+      <button id="btnGetEvents" class="btn-small">Get App Events</button>
+      <button id="btnGetSpaceEvents" class="btn-small btn-outline">Space Events</button>
+    </div>
+    <div id="eventsList" class="server-info hidden" style="margin-top:6px;max-height:200px;overflow-y:auto"></div>
+  </div>
+  <div class="section-card">
+    <h3>AI Skill</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Generate an AI skill so Claude, Cursor, Copilot can use cds-tool for CAP debugging.</p>
+    <div id="smdgStatus" class="server-info hidden" style="font-size:10px;margin-bottom:4px"></div>
+    <div class="row" style="gap:4px;flex-wrap:wrap">
+      <button id="btnGenSkill" class="btn-small">Generate (local)</button>
+      <button id="btnSmdgGenSkill" class="btn-small btn-outline">Generate (Smidge AI)</button>
+      <button id="btnSmdgLogin" class="btn-small btn-outline">Smidge Login</button>
+      <button id="btnSmdgCredits" class="btn-small btn-outline">Credits</button>
+    </div>
+    <div id="skillStatus" class="server-info hidden" style="margin-top:6px"></div>
+  </div>
+  <div class="section-card">
+    <h3>XSUAA Token</h3>
+    <select id="xsuaaAppSelect"><option value="">Select app...</option></select>
+    <button id="btnGetToken" class="btn-small">Get XSUAA Token</button>
+    <div id="tokenStatus" class="server-info hidden" style="margin-top:6px"></div>
+  </div>
+  <div class="section-card">
+    <h3>Bruno API Runner</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Run Bruno collections against CF services with auto-injected XSUAA tokens.</p>
+    <input id="brunoCollectionPath" placeholder="Path to Bruno collection" style="font-size:10px">
+    <button id="btnBrunoRun" class="btn-small">Run Collection</button>
+    <div id="brunoStatus" class="server-info hidden" style="margin-top:6px;font-size:10px"></div>
+  </div>
+  <div class="section-card">
+    <h3>GitPort (GitLab MR)</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Port a GitLab MR into another repo as a Draft MR.</p>
+    <input id="gitportSourceUrl" placeholder="Source MR URL" style="font-size:10px">
+    <input id="gitportDestRepo" placeholder="Dest repo (git@... or https://...)" style="font-size:10px">
+    <input id="gitportDestBranch" placeholder="Dest branch name" style="font-size:10px">
+    <button id="btnGitportCreate" class="btn-small">Port MR</button>
+    <div id="gitportStatus" class="server-info hidden" style="margin-top:6px;font-size:10px"></div>
+  </div>
+  <div class="section-card">
+    <h3>Jira</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Search issues, get details, transition, or comment. Uses JiraOps OAuth token.</p>
+    <input id="jiraInput" placeholder="JQL or issue key (e.g. PROJ-123)" style="font-size:10px">
+    <div class="row" style="gap:4px">
+      <button id="btnJiraSearch" class="btn-small">Search</button>
+      <button id="btnJiraGet" class="btn-small btn-outline">Get Issue</button>
+    </div>
+    <div id="jiraStatus" class="server-info hidden" style="margin-top:6px;max-height:150px;overflow-y:auto;font-size:10px"></div>
+  </div>
+  <div class="section-card">
+    <h3>SharePoint Excel</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Create, read, or append to SharePoint-hosted workbooks. Uses app-only Graph access.</p>
+    <input id="spSiteId" placeholder="SharePoint site ID" style="font-size:10px">
+    <input id="spDrivePath" placeholder="Drive path (e.g. /Shared Documents)" style="font-size:10px">
+    <input id="spFileName" placeholder="File name (e.g. data.json)" style="font-size:10px">
+    <div class="row" style="gap:4px">
+      <button id="btnSpCreate" class="btn-small">Create</button>
+      <button id="btnSpRead" class="btn-small btn-outline">Read</button>
+      <button id="btnSpAppend" class="btn-small btn-outline">Append</button>
+    </div>
+    <div id="spStatus" class="server-info hidden" style="margin-top:6px;font-size:10px"></div>
   </div>
 </div>
 
@@ -692,7 +1481,8 @@ document.getElementById('orgSelect').addEventListener('change',function(){
 document.getElementById('btnSaveSettings').addEventListener('click',function(){
   var root=document.getElementById('remoteRoot').value.trim()
   var sshUser=document.getElementById('sshUser').value.trim()
-  vscode.postMessage({type:'SAVE_SETTINGS',payload:{remoteRoot:root,sshUser:sshUser}})
+  var pkgRegex=document.getElementById('pkgRegexDefault').value.trim()
+  vscode.postMessage({type:'SAVE_SETTINGS',payload:{remoteRoot:root,sshUser:sshUser||undefined,pkgRegexDefault:pkgRegex||undefined}})
   document.getElementById('settingsStatus').classList.remove('hidden')
   document.getElementById('settingsStatus').innerHTML='<span style="color:var(--success)">Settings saved</span>'
   aLog('ok','Settings saved')
@@ -750,6 +1540,25 @@ document.getElementById('btnClearLogs').addEventListener('click',function(){
   aLog('info','Logs cleared')
 })
 
+document.getElementById('btnApplyLogFilter').addEventListener('click',function(){
+  var app=document.getElementById('logAppSelect').value
+  if(!app){aLog('warn','Select an app first');return}
+  var level=document.getElementById('logLevelFilter').value
+  var source=document.getElementById('logSourceFilter').value.trim()
+  var tenant=document.getElementById('logTenantFilter').value.trim()
+  var status=document.getElementById('logStatusFilter').value.trim()
+  var since=document.getElementById('logSinceFilter').value
+  vscode.postMessage({type:'QUERY_FILTER',payload:{appName:app,level:level||undefined,source:source||undefined,tenant:tenant||undefined,status:status||undefined,since:since||undefined}})
+})
+
+document.getElementById('btnClearLogFilter').addEventListener('click',function(){
+  document.getElementById('logLevelFilter').value=''
+  document.getElementById('logSourceFilter').value=''
+  document.getElementById('logTenantFilter').value=''
+  document.getElementById('logStatusFilter').value=''
+  document.getElementById('logSinceFilter').value=''
+})
+
 document.getElementById('btnGetDbCreds').addEventListener('click',function(){
   var app=document.getElementById('dbAppSelect').value
   if(!app){aLog('warn','Select an app');return}
@@ -796,7 +1605,10 @@ document.getElementById('btnBrowsePkg').addEventListener('click',function(){
   var app=document.getElementById('pkgAppSelect').value
   if(!app){aLog('warn','Select an app');return}
   var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
-  var filter=document.getElementById('pkgRegexFilter').value.trim()
+  var filterInput=document.getElementById('pkgRegexFilter')
+  var pkgDefault=document.getElementById('pkgRegexDefault').value.trim()
+  if(!filterInput.value.trim()&&pkgDefault)filterInput.value=pkgDefault
+  var filter=filterInput.value.trim()
   aLog('info','Browsing packages for '+app)
   document.getElementById('pkgList').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Listing packages...'
   document.getElementById('pkgList').classList.remove('hidden')
@@ -811,6 +1623,70 @@ document.getElementById('btnGetToken').addEventListener('click',function(){
   document.getElementById('tokenStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Getting token...'
   document.getElementById('tokenStatus').classList.remove('hidden')
   vscode.postMessage({type:'GET_XSUAA_TOKEN',payload:{appName:app,org:org,space:space}})
+})
+
+document.getElementById('btnBrunoRun').addEventListener('click',function(){
+  var path=document.getElementById('brunoCollectionPath').value.trim()
+  if(!path){aLog('warn','Enter Bruno collection path');return}
+  document.getElementById('brunoStatus').classList.remove('hidden')
+  document.getElementById('brunoStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Running Bruno collection...'
+  vscode.postMessage({type:'BRUNO_RUN',payload:{collectionPath:path}})
+})
+
+document.getElementById('btnGitportCreate').addEventListener('click',function(){
+  var url=document.getElementById('gitportSourceUrl').value.trim()
+  var repo=document.getElementById('gitportDestRepo').value.trim()
+  var branch=document.getElementById('gitportDestBranch').value.trim()
+  if(!url||!repo||!branch){aLog('warn','Fill in all GitPort fields');return}
+  document.getElementById('gitportStatus').classList.remove('hidden')
+  document.getElementById('gitportStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Porting MR...'
+  vscode.postMessage({type:'GITPORT_CREATE',payload:{sourceMrUrl:url,destRepo:repo,destBranch:branch}})
+})
+
+document.getElementById('btnJiraSearch').addEventListener('click',function(){
+  var q=document.getElementById('jiraInput').value.trim()
+  if(!q){aLog('warn','Enter JQL query');return}
+  document.getElementById('jiraStatus').classList.remove('hidden')
+  document.getElementById('jiraStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Searching...'
+  vscode.postMessage({type:'JIRA_SEARCH',payload:{jql:q}})
+})
+
+document.getElementById('btnJiraGet').addEventListener('click',function(){
+  var key=document.getElementById('jiraInput').value.trim()
+  if(!key){aLog('warn','Enter issue key');return}
+  document.getElementById('jiraStatus').classList.remove('hidden')
+  document.getElementById('jiraStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Loading...'
+  vscode.postMessage({type:'JIRA_ISSUE',payload:{issueKey:key}})
+})
+
+document.getElementById('btnSpCreate').addEventListener('click',function(){
+  var sid=document.getElementById('spSiteId').value.trim()
+  var dp=document.getElementById('spDrivePath').value.trim()
+  var fn=document.getElementById('spFileName').value.trim()
+  if(!sid||!dp||!fn){aLog('warn','Fill in SharePoint fields');return}
+  document.getElementById('spStatus').classList.remove('hidden')
+  document.getElementById('spStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Creating...'
+  vscode.postMessage({type:'SHAREPOINT_CREATE',payload:{siteId:sid,drivePath:dp,fileName:fn,data:[]}})
+})
+
+document.getElementById('btnSpRead').addEventListener('click',function(){
+  var sid=document.getElementById('spSiteId').value.trim()
+  var dp=document.getElementById('spDrivePath').value.trim()
+  var fn=document.getElementById('spFileName').value.trim()
+  if(!sid||!dp||!fn){aLog('warn','Fill in SharePoint fields');return}
+  document.getElementById('spStatus').classList.remove('hidden')
+  document.getElementById('spStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Reading...'
+  vscode.postMessage({type:'SHAREPOINT_READ',payload:{siteId:sid,drivePath:dp,fileName:fn}})
+})
+
+document.getElementById('btnSpAppend').addEventListener('click',function(){
+  var sid=document.getElementById('spSiteId').value.trim()
+  var dp=document.getElementById('spDrivePath').value.trim()
+  var fn=document.getElementById('spFileName').value.trim()
+  if(!sid||!dp||!fn){aLog('warn','Fill in SharePoint fields');return}
+  document.getElementById('spStatus').classList.remove('hidden')
+  document.getElementById('spStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Appending...'
+  vscode.postMessage({type:'SHAREPOINT_APPEND',payload:{siteId:sid,drivePath:dp,fileName:fn,data:[]}})
 })
 
 document.getElementById('btnShowWatchdog').addEventListener('click',function(){
@@ -855,6 +1731,186 @@ document.getElementById('btnGrepRemote').addEventListener('click',function(){
   vscode.postMessage({type:'EXPLORER_GREP',payload:{appName:app,org:org,space:space,query:query}})
 })
 
+document.getElementById('btnBrowseFolder').addEventListener('click',function(){
+  var org=document.getElementById('orgSelect').value
+  if(!org){aLog('warn','Select an org first');return}
+  var space=document.getElementById('spaceSelect').value
+  vscode.postMessage({type:'BROWSE_FOLDER',payload:{org:org,space:space}})
+})
+
+document.getElementById('btnListTables').addEventListener('click',function(){
+  var app=document.getElementById('dbAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  document.getElementById('sqlQueryArea').classList.remove('hidden')
+  document.getElementById('sqlInput').value='SELECT TABLE_NAME, TABLE_TYPE, SCHEMA_NAME FROM TABLES ORDER BY TABLE_NAME'
+  document.getElementById('sqlResult').innerHTML='<span class="spinner"></span> Loading tables...'
+  vscode.postMessage({type:'RUN_SQL',payload:{appName:app,org:org,space:space,sql:document.getElementById('sqlInput').value}})
+})
+
+document.getElementById('btnRunSql').addEventListener('click',function(){
+  var app=document.getElementById('dbAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  var sql=document.getElementById('sqlInput').value.trim()
+  if(!sql){aLog('warn','Enter SQL query');return}
+  document.getElementById('sqlResult').innerHTML='<span class="spinner"></span> Executing...'
+  vscode.postMessage({type:'RUN_SQL',payload:{appName:app,org:org,space:space,sql:sql}})
+})
+
+document.getElementById('btnClearSql').addEventListener('click',function(){
+  document.getElementById('sqlInput').value=''
+  document.getElementById('sqlResult').innerHTML=''
+})
+
+document.getElementById('btnStartTail').addEventListener('click',function(){
+  var checked=Array.from(document.querySelectorAll('.app-check:checked')).map(function(cb){return cb.value})
+  if(!checked.length){aLog('warn','Select apps in the Apps tab first');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  document.getElementById('tailContainer').innerHTML=''
+  document.getElementById('tailStatus').classList.remove('hidden')
+  document.getElementById('tailStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Tailing '+checked.length+' app(s)...'
+  vscode.postMessage({type:'START_TAIL',payload:{appNames:checked,org:org,space:space}})
+})
+
+document.getElementById('btnStopTail').addEventListener('click',function(){
+  vscode.postMessage({type:'STOP_TAIL'})
+  document.getElementById('tailStatus').innerHTML='Stopped'
+  document.getElementById('tailStatus').classList.remove('hidden')
+  aLog('info','Tail stopped')
+})
+
+document.getElementById('btnCheckConnection').addEventListener('click',function(){
+  vscode.postMessage({type:'CHECK_CONNECTION'})
+})
+
+// --- Trace buttons ---
+document.getElementById('btnStartTrace').addEventListener('click',function(){
+  var app=document.getElementById('traceAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org/space first');return}
+  vscode.postMessage({type:'START_TRACE',payload:{appName:app,org:org,space:space}})
+})
+
+document.getElementById('btnStopTrace').addEventListener('click',function(){
+  vscode.postMessage({type:'STOP_TRACE'})
+  document.getElementById('traceStatus').classList.remove('hidden')
+  document.getElementById('traceStatus').innerHTML='Trace stopped'
+})
+
+document.getElementById('btnClearTrace').addEventListener('click',function(){
+  document.getElementById('traceContainer').innerHTML=''
+  document.getElementById('traceContainer').classList.add('hidden')
+  document.getElementById('traceStatus').classList.add('hidden')
+})
+
+// --- Tools tab buttons ---
+document.getElementById('btnDownloadFile').addEventListener('click',function(){
+  var app=document.getElementById('toolsAppSelect').value,path=document.getElementById('toolsRemotePath').value.trim()
+  if(!app||!path){aLog('warn','Select app and enter remote path');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org/space first');return}
+  document.getElementById('downloadStatus').classList.remove('hidden')
+  document.getElementById('downloadStatus').innerHTML='<span class="spinner"></span> Downloading...'
+  vscode.postMessage({type:'DOWNLOAD_FILE',payload:{appName:app,org:org,space:space,remotePath:path}})
+})
+
+document.getElementById('btnDownloadFolder').addEventListener('click',function(){
+  var app=document.getElementById('toolsAppSelect').value,path=document.getElementById('toolsRemotePath').value.trim()
+  if(!app||!path){aLog('warn','Select app and enter remote path');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org/space first');return}
+  document.getElementById('downloadStatus').classList.remove('hidden')
+  document.getElementById('downloadStatus').innerHTML='<span class="spinner"></span> Downloading folder...'
+  vscode.postMessage({type:'DOWNLOAD_FOLDER',payload:{appName:app,org:org,space:space,remoteDir:path}})
+})
+
+document.getElementById('btnGenEnv').addEventListener('click',function(){
+  var app=document.getElementById('toolsAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org/space first');return}
+  document.getElementById('downloadStatus').classList.remove('hidden')
+  document.getElementById('downloadStatus').innerHTML='<span class="spinner"></span> Generating...'
+  vscode.postMessage({type:'GEN_ENV',payload:{appName:app,org:org,space:space}})
+})
+
+document.getElementById('btnOpenDevTools').addEventListener('click',function(){
+  var app=document.getElementById('inspectorAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  vscode.postMessage({type:'OPEN_DEVTOOLS',payload:{appName:app}})
+})
+
+document.getElementById('btnSetExceptionBp').addEventListener('click',function(){
+  var app=document.getElementById('inspectorAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org/space first');return}
+  vscode.postMessage({type:'SET_EXCEPTION_BP',payload:{appName:app,org:org,space:space}})
+})
+
+document.getElementById('btnListBp').addEventListener('click',function(){
+  var app=document.getElementById('inspectorAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  vscode.postMessage({type:'LIST_BREAKPOINTS',payload:{appName:app}})
+})
+
+document.getElementById('btnGetEvents').addEventListener('click',function(){
+  var app=document.getElementById('eventsAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org/space first');return}
+  document.getElementById('eventsList').classList.remove('hidden')
+  document.getElementById('eventsList').innerHTML='<span class="spinner"></span> Loading events...'
+  vscode.postMessage({type:'GET_EVENTS',payload:{appName:app,org:org,space:space}})
+})
+
+document.getElementById('btnGetSpaceEvents').addEventListener('click',function(){
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org/space first');return}
+  document.getElementById('eventsList').classList.remove('hidden')
+  document.getElementById('eventsList').innerHTML='<span class="spinner"></span> Loading space events...'
+  vscode.postMessage({type:'GET_SPACE_EVENTS',payload:{org:org,space:space}})
+})
+
+document.getElementById('btnGenSkill').addEventListener('click',function(){
+  document.getElementById('skillStatus').classList.remove('hidden')
+  document.getElementById('skillStatus').innerHTML='<span class="spinner"></span> Generating AI skill...'
+  vscode.postMessage({type:'GEN_SKILL',payload:{}})
+})
+
+document.getElementById('btnSmdgGenSkill').addEventListener('click',function(){
+  document.getElementById('skillStatus').classList.remove('hidden')
+  document.getElementById('skillStatus').innerHTML='<span class="spinner"></span> Generating skill via Smidge AI...'
+  vscode.postMessage({type:'GEN_SKILL',payload:{useSmdg:true}})
+})
+
+document.getElementById('btnSmdgLogin').addEventListener('click',function(){
+  document.getElementById('smdgStatus').classList.remove('hidden')
+  document.getElementById('smdgStatus').innerHTML='<span class="spinner"></span> Logging into Smidge...'
+  vscode.postMessage({type:'SMDG_LOGIN'})
+})
+
+document.getElementById('btnSmdgCredits').addEventListener('click',function(){
+  document.getElementById('smdgStatus').classList.remove('hidden')
+  document.getElementById('smdgStatus').innerHTML='<span class="spinner"></span> Checking credits...'
+  vscode.postMessage({type:'SMDG_CREDITS'})
+})
+
+// Auto-refresh apps every 30s
+var autoRefreshTimer=null
+function startAutoRefresh(){
+  if(autoRefreshTimer)clearInterval(autoRefreshTimer)
+  autoRefreshTimer=setInterval(function(){
+    var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+    if(org&&space)vscode.postMessage({type:'LOAD_APPS',payload:{org:org,space:space,force:true}})
+  },30000)
+}
+function stopAutoRefresh(){
+  if(autoRefreshTimer){clearInterval(autoRefreshTimer);autoRefreshTimer=null}
+}
+
 window.addEventListener('message',function(e){
   var msg=e.data
   switch(msg.type){
@@ -863,6 +1919,8 @@ window.addEventListener('message',function(e){
       document.getElementById('loginStatus').innerHTML='<span style="color:var(--success)">Connected to '+msg.payload.apiEndpoint+'</span>'
       aLog('ok','Connected to '+msg.payload.apiEndpoint)
       document.getElementById('orgSelect').innerHTML='<option value="">Loading...</option>'
+      // Check connection status right after login
+      vscode.postMessage({type:'CHECK_CONNECTION'})
       populateOrgs(msg.payload.orgs)
       showTab('apps')
       break
@@ -870,6 +1928,9 @@ window.addEventListener('message',function(e){
       document.getElementById('btnLogin').disabled=false
       document.getElementById('loginStatus').innerHTML='<span style="color:var(--error)">'+esc(msg.payload.message)+'</span>'
       aLog('err','Login failed: '+msg.payload.message)
+      break
+    case 'LOGOUT':
+      stopAutoRefresh()
       break
     case 'SPACES_LOADED':{
       var sel=document.getElementById('spaceSelect')
@@ -891,9 +1952,14 @@ window.addEventListener('message',function(e){
       populateSelect('logAppSelect',apps)
       populateSelect('dbAppSelect',apps)
       populateSelect('pkgAppSelect',apps)
-      populateSelect('xsuaaAppSelect',apps)
       populateSelect('explorerAppSelect',apps)
-      aLog(msg.payload.fromCache?'info':'ok','Loaded '+apps.length+' app(s)'+(msg.payload.fromCache?' (from cache)':''))
+      populateSelect('toolsAppSelect',apps)
+      populateSelect('inspectorAppSelect',apps)
+      populateSelect('eventsAppSelect',apps)
+      populateSelect('traceAppSelect',apps)
+      populateSelect('xsuaaAppSelect',apps)
+      aLog('info','Loaded '+apps.length+' app(s)'+(msg.payload.fromCache?' (cached)':''))
+      startAutoRefresh()
       break
     case 'APPS_ERROR':
       document.getElementById('appsList').innerHTML='<div style="color:var(--error)">'+esc(msg.payload.message)+'</div>'
@@ -972,12 +2038,15 @@ window.addEventListener('message',function(e){
       if(msg.payload.activeSessions)for(var i=0;i<msg.payload.activeSessions.length;i++)activeSessions[msg.payload.activeSessions[i]]='ATTACHED'
       renderSessions()
       aLog('info','Config loaded'+(msg.payload.credentialSource==='env'?' (auto-detected)':''))
+      // Check connection health
+      vscode.postMessage({type:'CHECK_CONNECTION'})
       break
     }
 
     case 'SETTINGS_LOADED':{
       if(msg.payload.remoteRoot)document.getElementById('remoteRoot').value=msg.payload.remoteRoot
       if(msg.payload.sshUser)document.getElementById('sshUser').value=msg.payload.sshUser
+      if(msg.payload.pkgRegexDefault)document.getElementById('pkgRegexDefault').value=msg.payload.pkgRegexDefault
       var fm=document.getElementById('folderMappings')
       if(msg.payload.folderMappings&&msg.payload.folderMappings.length){
         fm.innerHTML=msg.payload.folderMappings.map(function(m){
@@ -1092,24 +2161,342 @@ window.addEventListener('message',function(e){
       break
     }
 
+    case 'TAIL_LINE':{
+      var tc=document.getElementById('tailContainer')
+      var div=document.createElement('div');div.className='tail-line'
+      var tag=document.createElement('span');tag.className='app-tag'
+      tag.style.background='linear-gradient(135deg,'+stringToColor(msg.payload.appName)+',rgba(0,0,0,.3))'
+      tag.textContent=msg.payload.appName
+      div.appendChild(tag)
+      div.appendChild(document.createTextNode(msg.payload.line))
+      tc.appendChild(div);tc.scrollTop=tc.scrollHeight
+      break
+    }
+
+    case 'SQL_RESULT':{
+      var sr=document.getElementById('sqlResult')
+      if(msg.payload.error){
+        sr.innerHTML='<div style="color:var(--error);padding:8px;background:rgba(248,81,73,.1);border-radius:6px;margin-top:6px">'+esc(msg.payload.error)+'</div>'
+      }else if(msg.payload.columns&&msg.payload.columns.length){
+        var html='<div class="sql-table-wrap"><table class="sql-table"><thead><tr>'
+        msg.payload.columns.forEach(function(c){html+='<th>'+esc(c)+'</th>'})
+        html+='</tr></thead><tbody>'
+        msg.payload.rows.forEach(function(r){
+          html+='<tr>'
+          r.forEach(function(v){html+='<td>'+esc(v==null?'NULL':String(v))+'</td>'})
+          html+='</tr>'
+        })
+        html+='</tbody></table></div>'
+        html+='<div style="font-size:10px;color:var(--text-muted);padding:4px 0">'+msg.payload.rows.length+' row(s)</div>'
+        sr.innerHTML=html
+      }else{
+        sr.innerHTML='<div style="color:var(--success);padding:8px">Query executed (0 rows)</div>'
+      }
+      break
+    }
+
+    case 'CF_READY':{
+      var cfStatus=document.getElementById('cfStatus')
+      if(cfStatus){
+        cfStatus.innerHTML=msg.payload.ready
+          ? '<span style="color:var(--success)">&#9679; CF CLI ready</span>'
+          : '<span style="color:var(--error)">&#9679; CF CLI not found</span>'
+      }
+      break
+    }
+
+    case 'CONNECTION_HEALTH':{
+      var ch=document.getElementById('connectionStatus')
+      if(!ch)break
+      if(msg.payload.ok){
+        ch.innerHTML='<span style="color:var(--success)">&#9679; <strong>'+esc(msg.payload.user||'')+'</strong> / '+esc(msg.payload.org||'-')+' / '+esc(msg.payload.space||'-')+'</span>'
+      }else{
+        ch.innerHTML='<span style="color:var(--warn)">&#9679; Not logged in</span>'
+      }
+      break
+    }
+
+    case 'APP_RESTARTED':{
+      aLog('ok','App '+msg.payload.appName+' restarted')
+      break
+    }
+
+    case 'SERVICES_LOADED':{
+      var appName=msg.payload.appName
+      var sl=document.querySelector('.services-list[data-app="'+CSS.escape(appName)+'"]')
+      if(!sl)break
+      if(msg.payload.services.length){
+        sl.innerHTML='<span style="color:var(--text-muted)">Services:</span> '+msg.payload.services.map(function(s){return '<span style="display:inline-block;background:var(--card);border:1px solid var(--border);border-radius:4px;padding:1px 4px;margin:1px;font-size:10px">'+esc(s)+'</span>'}).join('')
+      }else{
+        sl.innerHTML='<span style="color:var(--text-muted)">No services bound</span>'
+      }
+      break
+    }
+
+    case 'FILE_DOWNLOADED':{
+      var ds=document.getElementById('downloadStatus')
+      if(ds)ds.innerHTML='<span style="color:var(--success)">&#9679; Downloaded: '+esc(msg.payload.localPath)+' ('+msg.payload.size+'b)</span>'
+      break
+    }
+    case 'FOLDER_DOWNLOADED':{
+      var ds=document.getElementById('downloadStatus')
+      if(ds)ds.innerHTML='<span style="color:var(--success)">&#9679; Downloaded '+msg.payload.files+' files to '+esc(msg.payload.localDir)+'</span>'
+      break
+    }
+    case 'ENV_GENERATED':{
+      var ds=document.getElementById('downloadStatus')
+      if(ds)ds.innerHTML='<span style="color:var(--success)">&#9679; default-env.json generated at '+esc(msg.payload.localPath)+'</span>'
+      break
+    }
+    case 'EXCEPTION_BP_SET':{
+      var is=document.getElementById('inspectorStatus')
+      if(is){is.classList.remove('hidden');is.innerHTML='<span style="color:var(--success)">&#9679; Exception BP set on '+esc(msg.payload.appName)+'</span>'}
+      break
+    }
+    case 'BREAKPOINT_LIST':{
+      var is=document.getElementById('inspectorStatus')
+      if(!is)break
+      is.classList.remove('hidden')
+      var bps=msg.payload.breakpoints
+      if(bps.length){
+        is.innerHTML='<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">Breakpoints:</div>'+
+          bps.map(function(b){return '<div style="font-size:10px;padding:2px 0">'+esc(b.url)+':'+b.line+(b.condition?' if '+esc(b.condition):'')+(b.logMessage?' log: '+esc(b.logMessage):'')+(b.hitCount?' hit: '+b.hitCount:'')+'</div>'}).join('')
+      }else{
+        is.innerHTML='<span style="color:var(--text-muted)">No breakpoints</span>'
+      }
+      break
+    }
+    case 'EVENTS_LOADED':{
+      var el=document.getElementById('eventsList')
+      if(!el)break
+      el.classList.remove('hidden')
+      if(msg.payload.events.length){
+        el.innerHTML=msg.payload.events.slice(0,50).map(function(e){return '<div style="font-size:10px;padding:3px 0;border-bottom:1px solid var(--border)"><span style="color:var(--text-muted)">'+esc(e.time)+'</span> <strong>'+esc(e.event)+'</strong> <span style="color:var(--text-muted)">'+esc(e.actor)+'</span><br><span style="font-size:9px">'+esc(e.description)+'</span></div>'}).join('')
+      }else{
+        el.innerHTML='<span style="color:var(--text-muted)">No events found</span>'
+      }
+      break
+    }
+    case 'SKILL_GENERATED':{
+      var ss=document.getElementById('skillStatus')
+      if(ss){ss.innerHTML='<span style="color:var(--success)">&#9679; AI skill generated: '+esc(msg.payload.localPath)+'</span>'}
+      break
+    }
+    case 'STACK_CAPTURE':{
+      var is=document.getElementById('inspectorStatus')
+      if(!is)break
+      is.classList.remove('hidden')
+      if(msg.payload.stack.length){
+        is.innerHTML='<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">Stack:</div>'+
+          msg.payload.stack.map(function(s){return '<div style="font-size:10px;padding:1px 0;font-family:monospace">'+esc(s)+'</div>'}).join('')
+      }else{
+        is.innerHTML='<span style="color:var(--warn)">No stack frames</span>'
+      }
+      break
+    }
+    case 'TRACE_LINE':{
+      var traceContainer=document.getElementById('traceContainer')
+      if(!traceContainer)break
+      traceContainer.classList.remove('hidden')
+      var line=document.createElement('div');line.className='tail-line'
+      line.style.fontSize='10px';line.style.color='var(--accent)'
+      line.textContent='['+msg.payload.appName+'] '+msg.payload.line
+      traceContainer.appendChild(line);traceContainer.scrollTop=traceContainer.scrollHeight
+      break
+    }
+    case 'TRACE_STATUS':{
+      var traceStatus=document.getElementById('traceStatus')
+      if(!traceStatus)break
+      traceStatus.innerHTML=msg.payload.active
+        ? '<span style="color:var(--success)">&#9679; Tracing '+esc(msg.payload.appName)+'</span>'
+        : '<span style="color:var(--text-muted)">Trace stopped</span>'
+      break
+    }
+
+    case 'QUERY_RESULT':{
+      var sr=document.getElementById('sqlResult')
+      if(!sr)break
+      if(msg.payload.error){
+        sr.innerHTML='<div style="color:var(--error);padding:8px">'+esc(msg.payload.error)+'</div>'
+      }else if(msg.payload.columns&&msg.payload.columns.length){
+        var html='<div class="sql-table-wrap"><table class="sql-table"><thead><tr>'
+        msg.payload.columns.forEach(function(c){html+='<th>'+esc(c)+'</th>'})
+        html+='</tr></thead><tbody>'
+        msg.payload.rows.forEach(function(r){
+          html+='<tr>'
+          r.forEach(function(v){html+='<td>'+esc(v==null?'NULL':String(v))+'</td>'})
+          html+='</tr>'
+        })
+        html+='</tbody></table></div>'
+        html+='<div style="font-size:10px;color:var(--text-muted);padding:4px 0">'+msg.payload.rows.length+' row(s)</div>'
+        sr.innerHTML=html
+      }else{
+        sr.innerHTML='<div style="color:var(--success);padding:8px">Query executed (0 rows)</div>'
+      }
+      break
+    }
+
+    case 'QUERY_FILTERED':{
+      var lc=document.getElementById('logContainer')
+      if(!lc)break
+      if(msg.payload.entries.length){
+        lc.innerHTML=msg.payload.entries.map(function(e){return '<div class="log-entry" style="font-size:10px">'+esc(e.message||'')+'</div>'}).join('')
+      }else{
+        lc.innerHTML='<div style="color:var(--text-muted);padding:8px">No matching log entries</div>'
+      }
+      break
+    }
+
+    case 'TRANSACTION_STARTED':{
+      aLog('ok','Transaction started: '+esc(msg.payload.id))
+      break
+    }
+
+    case 'TRANSACTION_COMMITTED':
+    case 'TRANSACTION_ROLLED_BACK':{
+      var txStatus=document.getElementById('dbInfo')
+      var label=msg.type==='TRANSACTION_COMMITTED'?'Committed':'Rolled back'
+      if(txStatus){txStatus.classList.remove('hidden');txStatus.innerHTML='<span style="color:var(--warn)">&#9679; Transaction '+label+'</span>'}
+      break
+    }
+
+    case 'BREAKPOINT_SET':{
+      var id=msg.payload.id||'?'
+      aLog('ok','BP set ['+id+'] at '+esc(msg.payload.url||'?')+':'+msg.payload.line)
+      break
+    }
+
+    case 'BREAKPOINT_REMOVED':{
+      aLog('info','BP removed ['+(msg.payload.id||'?')+']')
+      break
+    }
+
+    case 'BREAKPOINT_HIT':{
+      var is=document.getElementById('inspectorStatus')
+      if(!is)break
+      is.classList.remove('hidden')
+      is.innerHTML='<span style="color:var(--warn)">&#9679; BP hit: '+esc(msg.payload.url||'?')+':'+msg.payload.line+'</span>'
+      break
+    }
+
+    case 'BRUNO_RESULT':
+    case 'BRUNO_SETUP_RESULT':{
+      var bs=document.getElementById('brunoStatus')
+      if(!bs)break
+      if(msg.payload.success){
+        var out=msg.type==='BRUNO_SETUP_RESULT'?('Collection setup at: '+esc(msg.payload.outputDir||'')):(msg.payload.output||'Done')
+        bs.innerHTML='<span style="color:var(--success)">&#9679; '+out+'</span>'
+      }else{
+        bs.innerHTML='<span style="color:var(--error)">&#9679; '+esc(msg.payload.error||'Failed')+'</span>'
+      }
+      break
+    }
+
+    case 'GITPORT_RESULT':{
+      var gs=document.getElementById('gitportStatus')
+      if(!gs)break
+      if(msg.payload.success){
+        gs.innerHTML='<span style="color:var(--success)">&#9679; MR created: <a href="'+esc(msg.payload.mrUrl||'')+'" target="_blank">'+esc(msg.payload.mrUrl||'')+'</a></span>'
+      }else{
+        gs.innerHTML='<span style="color:var(--error)">&#9679; '+esc(msg.payload.error||'Failed')+'</span>'
+      }
+      break
+    }
+
+    case 'JIRA_RESULT':{
+      var js=document.getElementById('jiraStatus')
+      if(!js)break
+      if(msg.payload.success){
+        var d=msg.payload.data
+        if(Array.isArray(d)){
+          js.innerHTML=d.slice(0,20).map(function(i){return '<div style="padding:2px 0;font-size:10px;border-bottom:1px solid var(--border)"><strong>'+esc(i.key)+'</strong> '+esc(i.summary)+' <span style="color:var(--text-muted)">['+esc(i.status)+']</span></div>'}).join('')
+        }else if(d&&d.key){
+          js.innerHTML='<div style="padding:4px 0"><strong>'+esc(d.key)+'</strong> '+esc(d.summary)+'<br><span style="color:var(--text-muted)">Status: '+esc(d.status)+' | Assignee: '+esc(d.assignee||'-')+' | Priority: '+esc(d.priority||'-')+'</span></div>'
+        }else{
+          js.innerHTML='<span style="color:var(--success)">&#9679; Done</span>'
+        }
+      }else{
+        js.innerHTML='<span style="color:var(--error)">&#9679; '+esc(msg.payload.error||'Failed')+'</span>'
+      }
+      break
+    }
+
+    case 'SHAREPOINT_RESULT':{
+      var ss=document.getElementById('spStatus')
+      if(!ss)break
+      if(msg.payload.success){
+        var d=msg.payload.data
+        if(Array.isArray(d)){
+          ss.innerHTML='<span style="color:var(--success)">&#9679; Read '+d.length+' records</span>'
+        }else{
+          ss.innerHTML='<span style="color:var(--success)">&#9679; Done</span>'
+        }
+      }else{
+        ss.innerHTML='<span style="color:var(--error)">&#9679; '+esc(msg.payload.error||'Failed')+'</span>'
+      }
+      break
+    }
+
+    case 'SMDG_STATUS':{
+      var ss=document.getElementById('smdgStatus')
+      if(!ss)break
+      ss.classList.remove('hidden')
+      ss.innerHTML=msg.payload.available
+        ? '<span style="color:var(--success)">&#9679; Smidge CLI available</span>'
+        : '<span style="color:var(--warn)">&#9679; Smidge CLI not found (npm i -g smdg-cli)</span>'
+      break
+    }
+
+    case 'SMDG_RESULT':{
+      var ss=document.getElementById('smdgStatus')
+      if(!ss)break
+      ss.classList.remove('hidden')
+      if(msg.payload.success){
+        ss.innerHTML='<span style="color:var(--success)">&#9679; '+(msg.payload.output||'Done')+'</span>'
+      }else{
+        ss.innerHTML='<span style="color:var(--error)">&#9679; '+esc(msg.payload.error||'Failed')+'</span>'
+      }
+      break
+    }
+
+    case 'SMDG_SKILL_GENERATED':{
+      var sk=document.getElementById('skillStatus')
+      if(sk){
+        sk.classList.remove('hidden')
+        sk.innerHTML='<span style="color:var(--success)">&#9679; Skill: '+esc(msg.payload.skillPath||'')+'</span>'
+      }
+      break
+    }
   }
 })
+
+function stringToColor(s){
+  var hash=0;for(var i=0;i<s.length;i++){hash=s.charCodeAt(i)+((hash<<5)-hash)}
+  var hue=((hash%360)+360)%360
+  return 'hsl('+hue+',60%,50%)'
+}
 
 var REGIONS_CATALOG=[
   {key:'cf-ap10',label:'Australia',api:'https://api.cf.ap10.hana.ondemand.com'},
   {key:'cf-ap11',label:'Singapore',api:'https://api.cf.ap11.hana.ondemand.com'},
   {key:'cf-ap12',label:'Mumbai',api:'https://api.cf.ap12.hana.ondemand.com'},
+  {key:'cf-ap20',label:'Seoul',api:'https://api.cf.ap20.hana.ondemand.com'},
+  {key:'cf-ap21',label:'Osaka',api:'https://api.cf.ap21.hana.ondemand.com'},
   {key:'cf-br10',label:'São Paulo',api:'https://api.cf.br10.hana.ondemand.com'},
   {key:'cf-ca10',label:'Montreal',api:'https://api.cf.ca10.hana.ondemand.com'},
+  {key:'cf-ch20',label:'Zurich',api:'https://api.cf.ch20.hana.ondemand.com'},
   {key:'cf-eu10',label:'Frankfurt',api:'https://api.cf.eu10.hana.ondemand.com'},
   {key:'cf-eu11',label:'London',api:'https://api.cf.eu11.hana.ondemand.com'},
   {key:'cf-eu20',label:'Amsterdam',api:'https://api.cf.eu20.hana.ondemand.com'},
+  {key:'cf-eu30',label:'St. Leon Rot',api:'https://api.cf.eu30.hana.ondemand.com'},
+  {key:'cf-eu31',label:'Rot BLP',api:'https://api.cf.eu31.hana.ondemand.com'},
   {key:'cf-in30',label:'Hyderabad',api:'https://api.cf.in30.hana.ondemand.com'},
   {key:'cf-jp10',label:'Tokyo',api:'https://api.cf.jp10.hana.ondemand.com'},
   {key:'cf-us10',label:'US East',api:'https://api.cf.us10.hana.ondemand.com'},
-  {key:'cf-us20',label:'US West',api:'https://api.cf.us20.hana.ondemand.com'},
+  {key:'cf-us20',label:'US West (Sterling)',api:'https://api.cf.us20.hana.ondemand.com'},
+  {key:'cf-us21',label:'US West (Champaign)',api:'https://api.cf.us21.hana.ondemand.com'},
   {key:'cf-us30',label:'US Central',api:'https://api.cf.us30.hana.ondemand.com'},
-  {key:'cf-ch20',label:'Zurich',api:'https://api.cf.ch20.hana.ondemand.com'},
+  {key:'cf-us31',label:'US East BLP',api:'https://api.cf.us31.hana.ondemand.com'},
 ]
 
 function buildRegionGrid(){
@@ -1188,7 +2575,11 @@ function renderApps(list){
       var url=a.urls&&a.urls.length?'<span class="badge" data-url="'+esc(a.urls[0])+'">URL</span>':''
       var mod=mtaModuleType(a.name)
       var pill=mod?'<span class="pill pill-'+mod+'">'+mod+'</span>':''
-      return '<div class="app-item"><div class="cb-wrap">'+ch+'</div>'+pill+'<span class="name">'+esc(a.name)+'</span><span class="state-'+a.state+'">'+a.state+'</span>'+url+'</div>'
+      return '<div class="app-item"><div class="cb-wrap">'+ch+'</div>'+pill+'<span class="name">'+esc(a.name)+'</span><span class="state-'+a.state+'">'+a.state+'</span>'+url
+        +'<span class="badge btn-restart" data-app="'+esc(a.name)+'" style="color:var(--warn);cursor:pointer">&#8635;</span>'
+        +'<span class="badge btn-services" data-app="'+esc(a.name)+'" style="color:var(--accent);cursor:pointer">S</span>'
+        +'<span class="services-list" data-app="'+esc(a.name)+'" style="display:block;font-size:10px;margin-top:2px;grid-column:1/-1"></span>'
+        +'</div>'
     }).join('')
     return '<div class="project-group"><div class="project-header" data-project="'+esc(g.project)+'"><span class="arrow">&#9660;</span><span>'+esc(g.project)+'</span><span class="count">'+g.apps.length+'</span></div><div class="project-children">'+items+'</div></div>'
   }).join('')
@@ -1200,6 +2591,20 @@ function renderApps(list){
   })
   div.querySelectorAll('.app-check').forEach(function(cb){cb.addEventListener('change',updateDebugBtn)})
   div.querySelectorAll('.badge').forEach(function(el){el.addEventListener('click',function(){vscode.postMessage({type:'OPEN_APP',payload:{url:this.getAttribute('data-url')}})})})
+  div.querySelectorAll('.btn-restart').forEach(function(el){
+    el.addEventListener('click',function(){
+      var app=this.getAttribute('data-app'),org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+      if(!org||!space){aLog('warn','Select org/space first');return}
+      vscode.postMessage({type:'RESTART_APP',payload:{appName:app,org:org,space:space}})
+    })
+  })
+  div.querySelectorAll('.btn-services').forEach(function(el){
+    el.addEventListener('click',function(){
+      var app=this.getAttribute('data-app'),org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+      if(!org||!space){aLog('warn','Select org/space first');return}
+      vscode.postMessage({type:'LIST_SERVICES',payload:{appName:app,org:org,space:space}})
+    })
+  })
   updateDebugBtn()
   var countEl=document.querySelector('#tab-apps h3:last-child')
   if(countEl)countEl.textContent='Applications ('+list.length+')'

@@ -1,8 +1,14 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { processLogLine } from './logPipeline'
 
 const streams = new Map<string, ChildProcess>()
 export const events = new EventEmitter()
+
+let _filter: string = ''
+export function setLogFilter(filter: string): void {
+  _filter = filter
+}
 
 export function startLogStream(appName: string): boolean {
   if (streams.has(appName)) return false
@@ -14,7 +20,12 @@ export function startLogStream(appName: string): boolean {
     const lines = chunk.toString().split('\n')
     for (const line of lines) {
       const t = line.trimEnd()
-      if (t) events.emit('line', appName, t)
+      if (!t) continue
+      // Process through pipeline (redact, parse, store)
+      const entry = processLogLine(appName, t)
+      // Apply filter
+      if (_filter && !entry.message.toLowerCase().includes(_filter.toLowerCase())) continue
+      events.emit('line', appName, entry.message)
     }
   })
 
@@ -22,7 +33,10 @@ export function startLogStream(appName: string): boolean {
     const lines = chunk.toString().split('\n')
     for (const line of lines) {
       const t = line.trimEnd()
-      if (t) events.emit('line', appName, t)
+      if (!t) continue
+      const entry = processLogLine(appName, t)
+      if (_filter && !entry.message.toLowerCase().includes(_filter.toLowerCase())) continue
+      events.emit('line', appName, entry.message)
     }
   })
 

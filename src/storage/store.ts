@@ -5,6 +5,7 @@ const CONFIG_KEY = 'cds-tool.config'
 const CACHE_KEY = 'cds-tool.cache'
 const MAPPINGS_KEY = 'cds-tool.mappings'
 const SECRET_EMAIL = 'cds-tool.email'
+const SECRET_PASSWORD = 'cds-tool.password'
 
 let context: vscode.ExtensionContext | undefined
 
@@ -92,4 +93,20 @@ export async function saveEmail(email: string): Promise<void> {
 export async function loadEmail(): Promise<string> {
   if (!context) return ''
   return (await context.secrets.get(SECRET_EMAIL)) ?? ''
+}
+
+export async function savePassword(pw: string): Promise<void> {
+  if (!context) return
+  await context.secrets.store(SECRET_PASSWORD, pw)
+}
+
+export async function loadPassword(): Promise<string> {
+  if (!context) return ''
+  return (await context.secrets.get(SECRET_PASSWORD)) ?? ''
+}
+
+export async function clearSecrets(): Promise<void> {
+  if (!context) return
+  await context.secrets.delete(SECRET_EMAIL)
+  await context.secrets.delete(SECRET_PASSWORD)
 }
