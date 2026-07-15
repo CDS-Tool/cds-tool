@@ -1,8 +1,7 @@
 import * as vscode from 'vscode'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { cfSshSignal, cfEnableSsh, cfRestart, cfTarget } from './cfClient'
-
+import { cfSshSignal, cfEnableSsh, cfRestart, cfTarget, cfSshEnabled } from './cfClient'
 const DEBUG_PREFIX = 'Debug: '
 const BASE_PORT = 9229
 const MAX_RETRIES = 3
@@ -12,7 +11,16 @@ const processes = new Map<string, ChildProcess>()
 const ports = new Map<string, number>()
 const channels = new Map<string, vscode.OutputChannel>()
 const sessionStatus = new Map<string, string>()
+const spaceSshChecked = new Set<string>()
 export const events = new EventEmitter()
+
+function getShell(): string {
+  return process.env.SHELL || '/bin/zsh'
+}
+
+function shellEscape(a: string): string {
+  return `'${a.replace(/'/g, "'\\''")}'`
+}
 
 let portCounter = 0
 
@@ -71,6 +79,20 @@ export async function startDebugSession(
   channel.appendLine(`[CDS Tool] Targeting ${org}/${space}...`)
   await cfTarget(org, space)
 
+  // Check space SSH before proceeding
+  const spaceKey = `cf ${org}/${space}`
+  if (!spaceSshChecked.has(spaceKey)) {
+    channel.appendLine('[CDS Tool] Checking SSH access...')
+    const sshOk = await ensureSshAccess(appName, channel)
+    if (!sshOk) {
+      sessionStatus.delete(appName)
+      ports.delete(appName)
+      emitStatus(appName, 'ERROR')
+      throw new Error('SSH not available. Ensure cf ssh is allowed on this space.')
+    }
+    spaceSshChecked.add(spaceKey)
+  }
+
   channel.appendLine(`[CDS Tool] Activating Node inspector on ${appName}...`)
   const signaled = await signalInspector(appName, channel)
   if (!signaled) {
@@ -88,7 +110,9 @@ export async function startDebugSession(
   sessionStatus.set(appName, 'TUNNELING')
   emitStatus(appName, 'TUNNELING')
 
-  const child = spawn('cf', ['ssh', appName, '-L', tunnelArg, '-N'], {
+  const shell = getShell()
+  const sCmd = 'cf ' + ['ssh', appName, '-L', tunnelArg, '-N'].map(shellEscape).join(' ')
+  const child = spawn(shell, ['-l', '-c', sCmd], {
     cwd: folder,
     detached: process.platform !== 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -160,6 +184,24 @@ export async function startDebugSession(
   } else {
     sessionStatus.set(appName, 'ERROR')
     emitStatus(appName, 'ERROR')
+  }
+}
+
+async function ensureSshAccess(appName: string, ch: vscode.OutputChannel): Promise<boolean> {
+  try {
+    const enabled = await cfSshEnabled(appName)
+    if (!enabled) {
+      ch.appendLine('[CDS Tool] SSH disabled on app. Enabling...')
+      await cfEnableSsh(appName)
+      ch.appendLine('[CDS Tool] SSH enabled. Restarting app...')
+      await cfRestart(appName)
+      ch.appendLine('[CDS Tool] Waiting 20s for app restart...')
+      await sleep(20000)
+    }
+    return true
+  } catch (err: any) {
+    ch.appendLine(`[CDS Tool] SSH setup failed: ${err.message}`)
+    return false
   }
 }
 
