@@ -194,57 +194,77 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
     return `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
-:root{--bg:#1e1e1e;--fg:#d4d4d4;--border:#3c3c3c;--accent:#0078d4;--accent-hover:#1a8ae8;--success:#4caf50;--error:#f44747;--warn:#ff8c00;--card:#252526;--card-hover:#2a2d2e;--input-bg:#3c3c3c;--text-muted:#858585}
+:root{--bg:#1e1e1e;--fg:#d4d4d4;--border:#3c3c3c;--accent:#0078d4;--accent-hover:#1a8ae8;--success:#4caf50;--error:#f44747;--warn:#ff8c00;--card:#252526;--card-hover:#2a2d2e;--input-bg:#3c3c3c;--text-muted:#858585;--radius:6px}
+*{box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:12px;color:var(--fg);background:var(--bg);font-size:13px;margin:0;line-height:1.5}
 .hidden{display:none!important}
 .section{margin-bottom:16px}
-h3{margin:12px 0 8px;font-size:12px;font-weight:600;color:var(--fg);text-transform:uppercase;letter-spacing:.5px}
+h3{margin:10px 0 8px;font-size:11.5px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.8px}
 label{display:block;margin:6px 0 3px;font-size:11px;color:var(--text-muted);font-weight:500}
 input,select,button{width:100%;box-sizing:border-box;margin:3px 0;padding:6px 10px;font-size:12.5px}
-input,select{background:var(--input-bg);border:1px solid var(--border);color:var(--fg);border-radius:4px;transition:border-color .15s}
-input:focus,select:focus{outline:none;border-color:var(--accent)}
+input,select{background:var(--input-bg);border:1px solid var(--border);color:var(--fg);border-radius:var(--radius);transition:border-color .15s}
+input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 input::placeholder{color:var(--text-muted)}
-button{background:var(--accent);color:#fff;border:none;padding:7px 14px;cursor:pointer;border-radius:4px;font-weight:500;transition:background .15s}
-button:hover{background:var(--accent-hover)}
-button:active{transform:scale(.98)}
-button:disabled{opacity:.4;cursor:default;transform:none}
-.btn-danger{background:var(--error)}
-.btn-danger:hover{background:#e35f5f}
-.btn-success{background:var(--success)}
-.btn-success:hover{background:#5dbc5e}
-.btn-small{padding:3px 8px;font-size:11px;width:auto;border-radius:3px}
+button{background:var(--accent);color:#fff;border:none;padding:7px 14px;cursor:pointer;border-radius:var(--radius);font-weight:500;transition:all .12s;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+button:hover{background:var(--accent-hover);box-shadow:0 1px 3px rgba(0,0,0,.3)}
+button:active{transform:scale(.97)}
+button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
+.btn-danger{background:#c73e3e}
+.btn-danger:hover{background:var(--error)}
+.btn-success{background:#388e3c}
+.btn-success:hover{background:var(--success)}
+.btn-small{padding:4px 10px;font-size:11px;width:auto;border-radius:4px;font-weight:500}
+.btn-outline{background:transparent;border:1px solid var(--border);color:var(--fg)}
+.btn-outline:hover{background:var(--card-hover);border-color:var(--text-muted);box-shadow:none}
+.btn-icon{padding:4px;width:auto;background:transparent;color:var(--text-muted)}
+.btn-icon:hover{background:var(--card-hover);color:var(--fg);box-shadow:none}
 .row{display:flex;gap:6px;align-items:center}
 .row button{flex:1}
-.app-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid var(--border);transition:background .1s;border-radius:3px}
+.app-item{display:flex;align-items:center;gap:8px;padding:6px 8px;transition:background .1s;border-radius:4px}
 .app-item:hover{background:var(--card-hover)}
 .app-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;font-size:12.5px}
-.state-started{color:var(--success);font-size:11px;font-weight:500}
-.state-stopped{color:var(--text-muted);font-size:11px}
-.state-empty{color:var(--warn);font-size:11px}
-.badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--input-bg);cursor:pointer;transition:background .15s}
+.app-item .cb-wrap{display:flex;align-items:center}
+.app-check{width:auto;margin:0;accent-color:var(--accent);cursor:pointer}
+.state-started{color:var(--success);font-size:11px;font-weight:500;background:rgba(76,175,80,.12);padding:1px 6px;border-radius:3px}
+.state-stopped{color:var(--text-muted);font-size:11px;background:rgba(133,133,133,.1);padding:1px 6px;border-radius:3px}
+.state-empty{color:var(--warn);font-size:11px;background:rgba(255,140,0,.12);padding:1px 6px;border-radius:3px}
+.badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--input-bg);cursor:pointer;transition:all .12s}
 .badge:hover{background:var(--accent);color:#fff}
-.log-line{font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid rgba(255,255,255,.04);padding:2px 0}
-.log-container{max-height:300px;overflow-y:auto;background:#0d0d0d;padding:6px;border-radius:4px;font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;border:1px solid var(--border)}
+.log-line{font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid rgba(255,255,255,.04);padding:2px 0;transition:background .1s}
+.log-line:hover{background:rgba(255,255,255,.03)}
+.log-container{max-height:300px;overflow-y:auto;background:#0d0d0d;padding:6px;border-radius:var(--radius);font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;border:1px solid var(--border)}
 .status-ATTACHED{color:var(--success);font-size:11px;font-weight:500}
 .status-TUNNELING{color:var(--warn);font-size:11px}
 .status-SIGNALING{color:var(--warn);font-size:11px}
 .status-ERROR{color:var(--error);font-size:11px}
 .tab-bar{display:flex;gap:1px;margin-bottom:12px;position:sticky;top:0;background:var(--bg);z-index:1;padding:6px 0 0;border-bottom:1px solid var(--border)}
-.tab-bar button{flex:1;background:transparent;color:var(--text-muted);font-size:11.5px;padding:6px 4px;border-radius:0;border-bottom:2px solid transparent;margin:0;transition:color .15s,border-color .15s}
+.tab-bar button{flex:1;background:transparent;color:var(--text-muted);font-size:11.5px;padding:6px 4px;border-radius:0;border-bottom:2px solid transparent;margin:0;transition:all .15s;font-weight:400}
 .tab-bar button:hover{background:transparent;color:var(--fg)}
 .tab-bar button.active{background:transparent;color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
-.server-info{font-size:11.5px;color:var(--text-muted);padding:8px 10px;background:var(--card);border-radius:4px;margin:6px 0;word-break:break-all;border:1px solid var(--border)}
+.server-info{font-size:11.5px;color:var(--text-muted);padding:8px 10px;background:var(--card);border-radius:var(--radius);margin:6px 0;word-break:break-all;border:1px solid var(--border)}
 .pill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:10px;margin:2px 0;font-weight:500}
 .pill-env{background:var(--success);color:#fff}
 .pill-none{background:var(--text-muted);color:#fff}
+.pill-srv{background:#0078d4;color:#fff}
+.pill-db{background:#7c4dff;color:#fff}
+.pill-ui{background:#ff8c00;color:#fff}
+.pill-router{background:#00bcd4;color:#fff}
+.pill-job{background:#607d8b;color:#fff}
 .filter-input{margin:4px 0}
-.section-card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:12px}
+.section-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin-bottom:10px}
 #loadingOverlay{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
 #loadingOverlay.hidden{display:none}
-.spinner{width:18px;height:18px;border:2.5px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
+.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
 .loading-text{font-size:13px;color:var(--text-muted)}
-.app-check{width:auto;margin:0;accent-color:var(--accent);cursor:pointer}
+.project-group{margin-bottom:4px}
+.project-header{display:flex;align-items:center;gap:6px;padding:5px 6px;cursor:pointer;border-radius:4px;transition:background .1s;font-size:12px;font-weight:600;color:var(--fg);user-select:none}
+.project-header:hover{background:var(--card-hover)}
+.project-header .arrow{font-size:8px;transition:transform .15s;color:var(--text-muted)}
+.project-header .arrow.collapsed{transform:rotate(-90deg)}
+.project-header .count{font-size:10px;color:var(--text-muted);font-weight:400;margin-left:auto}
+.project-children{border-left:1px solid var(--border);margin-left:10px;padding-left:6px}
+.inline-spinner{display:inline-flex;align-items:center;gap:6px;color:var(--text-muted);font-size:12px}
 </style>
 </head><body>
 <div id="loadingOverlay"><div class="spinner"></div><div class="loading-text">Loading CDS Tool...</div></div>
@@ -543,6 +563,28 @@ function showTab(name){
   document.getElementById('tab-'+name).classList.remove('hidden')
   document.querySelector('.tab-bar button[data-tab="'+name+'"]').classList.add('active')
 }
+function mtaModuleType(name){
+  if(/-srv$/i.test(name))return 'srv'
+  if(/-(db|data|database)$/i.test(name))return 'db'
+  if(/-(ui|app|web|frontend)$/i.test(name))return 'ui'
+  if(/-router$/i.test(name))return 'router'
+  if(/-(job|scheduler|worker)$/i.test(name))return 'job'
+  return ''
+}
+function mtaProjectName(name){
+  var parts=name.split('-')
+  if(mtaModuleType(name)&&parts.length>1)return parts.slice(0,-1).join('-')
+  return name
+}
+function groupAppsByMta(list){
+  var groups={}
+  list.forEach(function(a){
+    var p=mtaProjectName(a.name)
+    if(!groups[p])groups[p]={project:p,apps:[]}
+    groups[p].apps.push(a)
+  })
+  return Object.values(groups).sort(function(a,b){return a.project.localeCompare(b.project)})
+}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function setSelectValue(id,val){
   var sel=document.getElementById(id)
@@ -562,14 +604,28 @@ function loadApps(){
 function renderApps(list){
   var div=document.getElementById('appsList')
   if(!list.length){div.innerHTML='<div class="server-info">No apps found</div>';return}
-  div.innerHTML=list.map(function(a){
-    var ch='<input type="checkbox" class="app-check" value="'+esc(a.name)+'">'
-    var url=a.urls&&a.urls.length?'<span class="badge" data-url="'+esc(a.urls[0])+'">URL</span>':''
-    return '<div class="app-item">'+ch+'<span class="name">'+esc(a.name)+'</span><span class="state-'+a.state+'">'+a.state+'</span>'+url+'</div>'
+  var groups=groupAppsByMta(list)
+  div.innerHTML=groups.map(function(g){
+    var items=g.apps.map(function(a){
+      var ch='<input type="checkbox" class="app-check" value="'+esc(a.name)+'">'
+      var url=a.urls&&a.urls.length?'<span class="badge" data-url="'+esc(a.urls[0])+'">URL</span>':''
+      var mod=mtaModuleType(a.name)
+      var pill=mod?'<span class="pill pill-'+mod+'">'+mod+'</span>':''
+      return '<div class="app-item"><div class="cb-wrap">'+ch+'</div>'+pill+'<span class="name">'+esc(a.name)+'</span><span class="state-'+a.state+'">'+a.state+'</span>'+url+'</div>'
+    }).join('')
+    return '<div class="project-group"><div class="project-header" data-project="'+esc(g.project)+'"><span class="arrow">&#9660;</span><span>'+esc(g.project)+'</span><span class="count">'+g.apps.length+'</span></div><div class="project-children">'+items+'</div></div>'
   }).join('')
+  div.querySelectorAll('.project-header').forEach(function(h){
+    h.addEventListener('click',function(){
+      var arrow=this.querySelector('.arrow'),children=this.nextElementSibling
+      arrow.classList.toggle('collapsed'),children.classList.toggle('hidden')
+    })
+  })
   div.querySelectorAll('.app-check').forEach(function(cb){cb.addEventListener('change',updateDebugBtn)})
   div.querySelectorAll('.badge').forEach(function(el){el.addEventListener('click',function(){vscode.postMessage({type:'OPEN_APP',payload:{url:this.getAttribute('data-url')}})})})
   updateDebugBtn()
+  var countEl=document.querySelector('#tab-apps h3:last-child')
+  if(countEl)countEl.textContent='Applications ('+list.length+')'
 }
 function updateDebugBtn(){
   var checked=document.querySelectorAll('.app-check:checked')
