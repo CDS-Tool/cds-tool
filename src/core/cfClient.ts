@@ -110,6 +110,34 @@ export async function cfEnv(app: string): Promise<string> {
   return cf(['env', app])
 }
 
+export interface CfTargetInfo {
+  apiEndpoint: string
+  user: string
+  org: string
+  space: string
+}
+
+export async function cfCurrentTarget(): Promise<CfTargetInfo | null> {
+  try {
+    const out = await cf(['target'])
+    const lines = out.split('\n').map(l => l.trim())
+    let apiEndpoint = ''
+    let user = ''
+    let org = ''
+    let space = ''
+    for (const l of lines) {
+      if (l.startsWith('API endpoint:')) apiEndpoint = l.split(':').slice(1).join(':').trim()
+      else if (l.startsWith('User:')) user = l.split(':').slice(1).join(':').trim()
+      else if (l.startsWith('Org:')) org = l.split(':').slice(1).join(':').trim()
+      else if (l.startsWith('Space:')) space = l.split(':').slice(1).join(':').trim()
+    }
+    if (!apiEndpoint) return null
+    return { apiEndpoint, user, org, space }
+  } catch {
+    return null
+  }
+}
+
 export async function cfLogout(): Promise<void> {
   await cf(['logout']).catch(() => {})
 }

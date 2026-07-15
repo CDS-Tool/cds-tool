@@ -34,6 +34,8 @@ export interface ExtensionConfig {
   lastOrg: string
   lastSpace: string
   remoteRoot: string
+  knownEndpoints: string[]
+  sshUser?: string
 }
 
 export interface DbCredentials {
@@ -62,9 +64,10 @@ export type WebviewMessage =
   | { type: 'RESET_LOGIN' }
   | { type: 'LOG'; payload: { level: string; message: string } }
   | { type: 'LOAD_SETTINGS' }
-  | { type: 'SAVE_SETTINGS'; payload: { remoteRoot: string } }
+  | { type: 'SAVE_SETTINGS'; payload: { remoteRoot: string; sshUser?: string; newEndpoint?: string } }
   | { type: 'BROWSE_PACKAGES'; payload: { appName: string; org: string; space: string } }
-  | { type: 'BROWSE_FILE'; payload: { appName: string; path: string } }
+  | { type: 'BROWSE_FILE'; payload: { appName: string; path: string; org: string; space: string } }
+  | { type: 'GENERATE_LAUNCH_CONFIG'; payload: { config: any; org: string; space: string; apiEndpoint: string } }
 
 export type ExtensionMessage =
   | { type: 'LOGIN_SUCCESS'; payload: { orgs: string[]; apiEndpoint: string } }
@@ -86,11 +89,12 @@ export type ExtensionMessage =
       defaultPassword?: string
       cachedRegions?: CachedRegion[]
       folderMappings?: OrgGroupMapping[]
+      cfTarget?: { apiEndpoint: string; user: string; org: string; space: string }
     } }
   | { type: 'DB_CREDENTIALS'; payload: { creds: DbCredentials | null; appName: string } }
   | { type: 'DB_CONNECTION_ADDED'; payload: { appName: string } }
   | { type: 'DB_ERROR'; payload: { message: string } }
   | { type: 'SESSION_UPDATED'; payload: { appName: string; status: string } }
-  | { type: 'SETTINGS_LOADED'; payload: { remoteRoot: string; folderMappings: OrgGroupMapping[] } }
+  | { type: 'SETTINGS_LOADED'; payload: { remoteRoot: string; sshUser?: string; folderMappings: OrgGroupMapping[] } }
   | { type: 'PACKAGES_LOADED'; payload: { appName: string; packages: string[]; error?: string } }
   | { type: 'FILE_CONTENT'; payload: { appName: string; path: string; content: string } }

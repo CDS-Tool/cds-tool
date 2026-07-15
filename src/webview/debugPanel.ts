@@ -52,9 +52,11 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
     logsManager.events.on('status', onLogStatus)
     this._disposables.push(new vscode.Disposable(() => logsManager.events.off('status', onLogStatus)))
 
-    // Auto-detect credentials and send to webview
+    // Auto-detect credentials and CF target
     const creds = await getCredentials()
     this._credentialSource = creds.email ? 'env' : 'none'
+    const { cfCurrentTarget } = await import('../core/cfClient')
+    const target = await cfCurrentTarget()
     post(view.webview, {
       type: 'CONFIG_LOADED',
       payload: {
@@ -63,6 +65,9 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
         credentialSource: this._credentialSource,
         defaultEmail: creds.email,
         defaultPassword: creds.password,
+        cachedRegions: loadCachedRegions(),
+        folderMappings: loadFolderMappings(),
+        cfTarget: target ?? undefined,
       },
     })
   }
@@ -78,10 +83,14 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
           await cfLogin(apiEndpoint, email, password)
           const orgs = await cfOrgs()
           const config = loadConfig() ?? {
-            apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '', remoteRoot: '/home/vcap/app',
+            apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '', remoteRoot: '/home/vcap/app', knownEndpoints: [],
           }
           config.apiEndpoint = apiEndpoint
           config.orgs = orgs
+          config.knownEndpoints = config.knownEndpoints ?? []
+          if (!config.knownEndpoints.includes(apiEndpoint)) {
+            config.knownEndpoints.push(apiEndpoint)
+          }
           saveConfig(config)
           await saveEmail(email)
           this._log('info', `Email saved to secret storage`)
@@ -201,6 +210,32 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
         await cfLogout()
         break
 
+      case 'GENERATE_LAUNCH_CONFIG': {
+        try {
+          const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+          if (!ws) {
+            this._log('warn', 'No workspace open, cannot generate launch.json')
+            break
+          }
+          const fs = await import('node:fs')
+          const path = await import('node:path')
+          const vscodeDir = path.join(ws, '.vscode')
+          if (!fs.existsSync(vscodeDir)) fs.mkdirSync(vscodeDir, { recursive: true })
+          const launchPath = path.join(vscodeDir, 'launch.json')
+          let existing: any = { version: '0.2.0', configurations: [] }
+          try {
+            existing = JSON.parse(fs.readFileSync(launchPath, 'utf-8'))
+          } catch {}
+          existing.configurations = existing.configurations ?? []
+          existing.configurations.push(msg.payload.config)
+          fs.writeFileSync(launchPath, JSON.stringify(existing, null, 2))
+          this._log('info', `Launch config written to ${launchPath}`)
+        } catch (err: any) {
+          this._log('err', `Failed to generate launch config: ${err.message}`)
+        }
+        break
+      }
+
       case 'LOG':
         this._log(msg.payload.level, msg.payload.message)
         break
@@ -210,6 +245,7 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
           type: 'SETTINGS_LOADED',
           payload: {
             remoteRoot: loadConfig()?.remoteRoot ?? '/home/vcap/app',
+            sshUser: loadConfig()?.sshUser,
             folderMappings: loadFolderMappings(),
           },
         })
@@ -217,9 +253,16 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
 
       case 'SAVE_SETTINGS': {
         const cfg = loadConfig() ?? {
-          apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '', remoteRoot: '/home/vcap/app',
+          apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '', remoteRoot: '/home/vcap/app', knownEndpoints: [], sshUser: undefined,
         }
         cfg.remoteRoot = msg.payload.remoteRoot
+        cfg.sshUser = msg.payload.sshUser || undefined
+        if (msg.payload.newEndpoint) {
+          cfg.knownEndpoints = cfg.knownEndpoints ?? []
+          if (!cfg.knownEndpoints.includes(msg.payload.newEndpoint)) {
+            cfg.knownEndpoints.push(msg.payload.newEndpoint)
+          }
+        }
         saveConfig(cfg)
         this._log('info', 'Settings saved')
         break
@@ -244,8 +287,8 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
 
       case 'BROWSE_FILE': {
         try {
-          const { appName, path } = msg.payload
-          const content = await packageBrowser.readRemoteFile(appName, '', '', path)
+          const { appName, path, org, space } = msg.payload
+          const content = await packageBrowser.readRemoteFile(appName, org, space, path)
           post(v.webview, {
             type: 'FILE_CONTENT',
             payload: { appName, path, content },
@@ -366,7 +409,14 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
 <div id="tab-login" class="section">
   <div class="section-card">
     <h3>Cloud Foundry Login</h3>
-    <label>API Endpoint</label>
+    <div id="cfLoggedInBanner" class="server-info hidden" style="background:var(--card-hover);border-left:3px solid var(--success);margin-bottom:8px"></div>
+    <label>Region / API Endpoint</label>
+    <div class="row" style="gap:4px">
+      <select id="regionSelect" style="flex:1">
+        <option value="">Custom...</option>
+      </select>
+      <button id="btnAddRegion" class="btn-small btn-outline" title="Save current endpoint as region">+</button>
+    </div>
     <input id="apiEndpoint" placeholder="https://api.cf.us10.hana.ondemand.com">
     <label>Email <span id="credSource" class="pill pill-none">manual</span></label>
     <input type="email" id="email" placeholder="user@domain.com">
@@ -402,6 +452,12 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     </div>
     <div id="sessionsList"></div>
   </div>
+  <div class="section-card">
+    <h3>Launch Config</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Generate a <code>launch.json</code> entry for the currently selected org/space.</p>
+    <button id="btnGenLaunchConfig" class="btn-small btn-outline">Generate launch.json</button>
+    <div id="launchConfigStatus" class="server-info hidden" style="margin-top:6px"></div>
+  </div>
 </div>
 
 <div id="tab-logs" class="section hidden">
@@ -427,6 +483,12 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <div id="dbInfo" class="server-info hidden"></div>
     <button id="btnAddDb" class="btn-success hidden">Add SQLTools Connection</button>
   </div>
+  <div class="section-card">
+    <h3>Package Browser</h3>
+    <select id="pkgAppSelect"><option value="">Select app...</option></select>
+    <button id="btnBrowsePkg">Browse package.json files</button>
+    <div id="pkgList" class="server-info hidden"></div>
+  </div>
 </div>
 
 <div id="tab-settings" class="section hidden">
@@ -434,6 +496,8 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <h3>Settings</h3>
     <label>Remote Root Path</label>
     <input id="remoteRoot" value="/home/vcap/app" placeholder="/home/vcap/app">
+    <label>SSH User (optional, for cf ssh)</label>
+    <input id="sshUser" placeholder="cfuser" style="font-size:11px">
     <label>Folder Mappings</label>
     <div id="folderMappings"></div>
     <button id="btnAddMapping" class="btn-small btn-outline" style="margin-top:4px">+ Add Mapping</button>
@@ -463,6 +527,22 @@ document.querySelectorAll('.tab-bar button').forEach(function(b){
     document.getElementById('tab-'+name).classList.remove('hidden')
     this.classList.add('active')
   })
+})
+
+document.getElementById('regionSelect').addEventListener('change',function(){
+  if(this.value)document.getElementById('apiEndpoint').value=this.value
+})
+document.getElementById('btnAddRegion').addEventListener('click',function(){
+  var api=document.getElementById('apiEndpoint').value.trim()
+  if(!api){aLog('err','Enter an API endpoint first');return}
+  var sel=document.getElementById('regionSelect')
+  for(var i=0;i<sel.options.length;i++){if(sel.options[i].value===api){aLog('info','Region already saved');return}}
+  var opt=document.createElement('option')
+  opt.value=api;opt.textContent=api.replace(/^https:\/\/api\./,'').replace(/\.hana\.ondemand\.com$/,'')
+  sel.insertBefore(opt,sel.lastElementChild)
+  sel.value=api
+  vscode.postMessage({type:'SAVE_SETTINGS',payload:{remoteRoot:document.getElementById('remoteRoot').value.trim(),newEndpoint:api}})
+  aLog('ok','Region saved: '+api)
 })
 
 document.getElementById('btnLogin').addEventListener('click',function(){
@@ -498,7 +578,8 @@ document.getElementById('orgSelect').addEventListener('change',function(){
 
 document.getElementById('btnSaveSettings').addEventListener('click',function(){
   var root=document.getElementById('remoteRoot').value.trim()
-  vscode.postMessage({type:'SAVE_SETTINGS',payload:{remoteRoot:root}})
+  var sshUser=document.getElementById('sshUser').value.trim()
+  vscode.postMessage({type:'SAVE_SETTINGS',payload:{remoteRoot:root,sshUser:sshUser}})
   document.getElementById('settingsStatus').classList.remove('hidden')
   document.getElementById('settingsStatus').innerHTML='<span style="color:var(--success)">Settings saved</span>'
   aLog('ok','Settings saved')
@@ -573,6 +654,41 @@ document.getElementById('btnAddDb').addEventListener('click',function(){
   vscode.postMessage({type:'ADD_DB_CONNECTION',payload:{appName:app,creds:creds}})
 })
 
+document.getElementById('btnGenLaunchConfig').addEventListener('click',function(){
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  var api=document.getElementById('apiEndpoint').value.trim()
+  if(!org||!space){aLog('warn','Select org and space first');return}
+  var cfg={
+    version:'0.2.0',
+    configurations:[{
+      type:'node',
+      request:'attach',
+      name:'CDS: '+org+'/'+space,
+      address:'localhost',
+      port:9229,
+      localRoot:'\${workspaceFolder}',
+      remoteRoot:'/home/vcap/app',
+      protocol:'inspector',
+      skipFiles:['<node_internals>/**']
+    }]
+  }
+  vscode.postMessage({type:'GENERATE_LAUNCH_CONFIG',payload:{config:cfg,org:org,space:space,apiEndpoint:api}})
+  var status=document.getElementById('launchConfigStatus')
+  status.classList.remove('hidden')
+  status.innerHTML='<span style="color:var(--success)">launch.json generated</span>'
+  aLog('ok','Launch config generated for '+org+'/'+space)
+})
+
+document.getElementById('btnBrowsePkg').addEventListener('click',function(){
+  var app=document.getElementById('pkgAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  aLog('info','Browsing packages for '+app)
+  document.getElementById('pkgList').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Listing packages...'
+  document.getElementById('pkgList').classList.remove('hidden')
+  vscode.postMessage({type:'BROWSE_PACKAGES',payload:{appName:app,org:org,space:space}})
+})
+
 window.addEventListener('message',function(e){
   var msg=e.data
   switch(msg.type){
@@ -608,6 +724,7 @@ window.addEventListener('message',function(e){
       renderApps(apps)
       populateSelect('logAppSelect',apps)
       populateSelect('dbAppSelect',apps)
+      populateSelect('pkgAppSelect',apps)
       aLog(msg.payload.fromCache?'info':'ok','Loaded '+apps.length+' app(s)'+(msg.payload.fromCache?' (from cache)':''))
       break
     case 'APPS_ERROR':
@@ -636,8 +753,9 @@ window.addEventListener('message',function(e){
       break
     }
     case 'CONFIG_LOADED':{
-      if(msg.payload.config){
-        var c=msg.payload.config
+      var cfConfig=msg.payload.config
+      if(cfConfig){
+        var c=cfConfig
         if(c.apiEndpoint){
           document.getElementById('apiEndpoint').value=c.apiEndpoint
         }
@@ -645,6 +763,9 @@ window.addEventListener('message',function(e){
         if(c.lastOrg)setSelectValue('orgSelect',c.lastOrg)
         if(c.lastSpace)setSelectValue('spaceSelect',c.lastSpace)
         if(c.remoteRoot)document.getElementById('remoteRoot').value=c.remoteRoot
+        if(c.sshUser)document.getElementById('sshUser').value=c.sshUser
+        // Populate region selector
+        populateRegionSelect(c.knownEndpoints||[],c.apiEndpoint)
       }
       if(msg.payload.defaultEmail){
         document.getElementById('email').value=msg.payload.defaultEmail
@@ -655,6 +776,16 @@ window.addEventListener('message',function(e){
       if(msg.payload.credentialSource==='env'){
         document.getElementById('credSource').textContent='auto-detected'
         document.getElementById('credSource').className='pill pill-env'
+      }
+      // Auto-detect cf target (already logged in via cf CLI)
+      var ct=msg.payload.cfTarget
+      if(ct&&ct.apiEndpoint){
+        var banner=document.getElementById('cfLoggedInBanner')
+        banner.classList.remove('hidden')
+        banner.innerHTML='<b>Already logged in</b> as '+esc(ct.user)+'<br><span style="font-size:11px">'+esc(ct.apiEndpoint)+' &middot; '+esc(ct.org)+'/'+esc(ct.space)+'</span>'
+        document.getElementById('apiEndpoint').value=ct.apiEndpoint
+        document.getElementById('loginStatus').innerHTML='<span style="color:var(--success)">&#9679; Detected CF session</span>'
+        aLog('info','Detected CF session: '+ct.apiEndpoint+' as '+ct.user)
       }
       // Show cache info
       var cacheDiv=document.getElementById('cacheInfo')
@@ -678,6 +809,7 @@ window.addEventListener('message',function(e){
 
     case 'SETTINGS_LOADED':{
       if(msg.payload.remoteRoot)document.getElementById('remoteRoot').value=msg.payload.remoteRoot
+      if(msg.payload.sshUser)document.getElementById('sshUser').value=msg.payload.sshUser
       var fm=document.getElementById('folderMappings')
       if(msg.payload.folderMappings&&msg.payload.folderMappings.length){
         fm.innerHTML=msg.payload.folderMappings.map(function(m){
@@ -688,11 +820,38 @@ window.addEventListener('message',function(e){
     }
 
     case 'PACKAGES_LOADED':{
+      var pkgDiv=document.getElementById('pkgList')
       if(msg.payload.error){
         aLog('err','Browse packages: '+msg.payload.error)
+        pkgDiv.innerHTML='<span style="color:var(--error)">'+esc(msg.payload.error)+'</span>'
       }else{
         aLog('ok','Found '+msg.payload.packages.length+' packages in '+msg.payload.appName)
+        pkgDiv.innerHTML=msg.payload.packages.map(function(p,i){
+          return '<div style="padding:2px 0;font-size:11px;cursor:pointer;color:var(--accent)" data-path="'+esc(p)+'" data-app="'+esc(msg.payload.appName)+'" class="pkg-item">'+(i+1)+'. '+esc(p)+'</div>'
+        }).join('')
+        pkgDiv.querySelectorAll('.pkg-item').forEach(function(el){
+          el.addEventListener('click',function(){
+            var app=this.getAttribute('data-app'),path=this.getAttribute('data-path')
+            var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+            vscode.postMessage({type:'BROWSE_FILE',payload:{appName:app,path:path,org:org,space:space}})
+            aLog('info','Reading '+path+' from '+app)
+            this.style.color='var(--text-muted)'
+          })
+        })
       }
+      break
+    }
+
+    case 'FILE_CONTENT':{
+      var aLogMsg='File: '+msg.payload.path+' ('+msg.payload.content.length+' chars)'
+      aLog('info',aLogMsg)
+      var pkgDiv=document.getElementById('pkgList')
+      var pre=document.createElement('pre')
+      pre.style.cssText='font-size:10px;line-height:1.4;max-height:300px;overflow:auto;background:var(--card-hover);padding:8px;border-radius:4px;margin-top:6px;white-space:pre-wrap;word-break:break-all'
+      pre.textContent=msg.payload.content.length>3000?msg.payload.content.substring(0,3000)+'\n\n... (truncated)':msg.payload.content
+      var existing=pkgDiv.querySelector('pre')
+      if(existing)existing.remove()
+      pkgDiv.appendChild(pre)
       break
     }
     case 'DB_CREDENTIALS':{
@@ -755,6 +914,12 @@ function groupAppsByMta(list){
   return Object.values(groups).sort(function(a,b){return a.project.localeCompare(b.project)})
 }
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function populateRegionSelect(endpoints,current){
+  var sel=document.getElementById('regionSelect')
+  var known=endpoints.filter(function(e){return e})
+  known=known.filter(function(v,i){return known.indexOf(v)===i})
+  sel.innerHTML='<option value="">Custom...</option>'+known.map(function(e){return '<option value="'+esc(e)+'"'+(e===current?' selected':'')+'>'+esc(e.replace(/^https:\/\/api\./,'').replace(/\.hana\.ondemand\.com$/,''))+'</option>'}).join('')
+}
 function setSelectValue(id,val){
   var sel=document.getElementById(id)
   for(var i=0;i<sel.options.length;i++){if(sel.options[i].value===val){sel.value=val;break}}
