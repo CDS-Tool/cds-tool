@@ -233,10 +233,25 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
 .log-line{font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid rgba(255,255,255,.04);padding:2px 0;transition:background .1s}
 .log-line:hover{background:rgba(255,255,255,.03)}
 .log-container{max-height:300px;overflow-y:auto;background:#0d0d0d;padding:6px;border-radius:var(--radius);font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;border:1px solid var(--border)}
-.status-ATTACHED{color:var(--success);font-size:11px;font-weight:500}
-.status-TUNNELING{color:var(--warn);font-size:11px}
-.status-SIGNALING{color:var(--warn);font-size:11px}
-.status-ERROR{color:var(--error);font-size:11px}
+.session-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:10px;margin-bottom:6px;transition:all .12s}
+.session-card:hover{border-color:var(--text-muted)}
+.session-card .top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.session-card .name{font-size:12.5px;font-weight:600;flex:1}
+.session-card .badge-status{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:500}
+.session-card .badge-ATTACHED{background:var(--success);color:#fff}
+.session-card .badge-CONNECTING{background:var(--accent);color:#fff}
+.session-card .badge-TUNNELING{background:var(--warn);color:#000}
+.session-card .badge-SIGNALING{background:var(--warn);color:#000}
+.session-card .badge-ERROR{background:var(--error);color:#fff}
+.session-card .badge-PENDING{background:var(--text-muted);color:#fff}
+.session-card .details{font-size:11px;color:var(--text-muted);padding:4px 0}
+.session-card .actions{display:flex;gap:4px;margin-top:6px}
+.status-ATTACHED{color:var(--success);font-size:11px;font-weight:500;display:none}
+.status-TUNNELING{color:var(--warn);font-size:11px;display:none}
+.status-SIGNALING{color:var(--warn);font-size:11px;display:none}
+.status-ERROR{color:var(--error);font-size:11px;display:none}
+.status-PENDING{color:var(--text-muted);font-size:11px;display:none}
+.status-CONNECTING{color:var(--accent);font-size:11px;display:none}
 .tab-bar{display:flex;gap:1px;margin-bottom:12px;position:sticky;top:0;background:var(--bg);z-index:1;padding:6px 0 0;border-bottom:1px solid var(--border)}
 .tab-bar button{flex:1;background:transparent;color:var(--text-muted);font-size:11.5px;padding:6px 4px;border-radius:0;border-bottom:2px solid transparent;margin:0;transition:all .15s;font-weight:400}
 .tab-bar button:hover{background:transparent;color:var(--fg)}
@@ -265,6 +280,8 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
 .project-header .count{font-size:10px;color:var(--text-muted);font-weight:400;margin-left:auto}
 .project-children{border-left:1px solid var(--border);margin-left:10px;padding-left:6px}
 .inline-spinner{display:inline-flex;align-items:center;gap:6px;color:var(--text-muted);font-size:12px}
+.db-table td:first-child{font-weight:500}
+.db-table td:last-child{font-family:monospace;font-size:11px}
 </style>
 </head><body>
 <div id="loadingOverlay"><div class="spinner"></div><div class="loading-text">Loading CDS Tool...</div></div>
@@ -538,7 +555,14 @@ window.addEventListener('message',function(e){
       window.__lastDbCreds=msg.payload.creds;window.__lastDbApp=msg.payload.appName
       if(msg.payload.creds){
         div.classList.remove('hidden')
-        div.innerHTML='<b>Host:</b> '+esc(msg.payload.creds.host)+':'+msg.payload.creds.port+'<br><b>DB:</b> '+esc(msg.payload.creds.database)+'<br><b>User:</b> '+esc(msg.payload.creds.user)
+        var html='<table class="db-table" style="width:100%;border-collapse:collapse;font-size:11.5px">'
+        html+=row('Host',esc(msg.payload.creds.host)+':'+msg.payload.creds.port)
+        html+=row('Database',esc(msg.payload.creds.database))
+        html+=row('User',esc(msg.payload.creds.user))
+        html+=row('Schema',esc(msg.payload.creds.schema||'(default)'))
+        html+=row('Password','<span style="font-family:monospace">'+esc(msg.payload.creds.password)+'</span>')
+        html+='</table>'
+        div.innerHTML=html
         btn.classList.remove('hidden')
         aLog('ok','DB credentials found for '+msg.payload.appName)
       }else{div.classList.remove('hidden');div.textContent='No HANA credentials found';btn.classList.add('hidden');aLog('warn','No HANA credentials for '+msg.payload.appName)}
@@ -637,15 +661,18 @@ function updateDebugBtn(){
 function renderSessions(){
   var div=document.getElementById('sessionsList')
   var keys=Object.keys(activeSessions)
-  if(!keys.length){div.innerHTML='<div class="server-info">No active sessions</div>';return}
+  if(!keys.length){div.innerHTML='<div class="server-info">No active debug sessions</div>';return}
   div.innerHTML=keys.map(function(app){
     var s=activeSessions[app]
-    return '<div class="app-item"><span class="name">'+esc(app)+'</span><span class="status-'+s+'">'+s+'</span><button class="btn-small btn-danger" data-app="'+esc(app)+'">Stop</button></div>'
+    var icon=s==='ATTACHED'?'&#9679;':s==='ERROR'?'&#10007;':s==='TUNNELING'||s==='SIGNALING'?'&#9881;':'&#9679;'
+    var detail=s==='ATTACHED'?'Debugger attached, inspect in Run & Debug view':s==='TUNNELING'?'Establishing SSH tunnel...':s==='SIGNALING'?'Sending inspector signal...':s==='ERROR'?'Failed to attach debugger':s==='CONNECTING'?'Connecting...':'Preparing...'
+    return '<div class="session-card"><div class="top"><span class="name">'+esc(app)+'</span><span class="badge-status badge-'+s+'">'+icon+' '+s+'</span></div><div class="details">'+detail+'</div><div class="actions"><button class="btn-small btn-danger" data-app="'+esc(app)+'">Stop</button></div></div>'
   }).join('')
   div.querySelectorAll('.btn-danger').forEach(function(el){el.addEventListener('click',function(){
     vscode.postMessage({type:'STOP_DEBUG',payload:{appName:this.getAttribute('data-app')}})
   })})
 }
+function row(l,v){return '<tr><td style="padding:3px 6px;color:var(--text-muted);white-space:nowrap;border-bottom:1px solid var(--border)">'+l+'</td><td style="padding:3px 6px;border-bottom:1px solid var(--border);word-break:break-all">'+v+'</td></tr>'}
 function populateSelect(id,list){
   var sel=document.getElementById(id)
   sel.innerHTML='<option value="">Select app...</option>'+list.map(function(a){return '<option value="'+esc(a.name)+'">'+esc(a.name)+'</option>'}).join('')
