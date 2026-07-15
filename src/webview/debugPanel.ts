@@ -1,0 +1,578 @@
+import * as vscode from 'vscode'
+import type { WebviewMessage, ExtensionMessage } from '../types'
+import { saveConfig, loadConfig, clearConfig } from '../storage/store'
+import { cfLogin, cfOrgs, cfTargetOrg, cfSpaces, cfApps, cfLogout } from '../core/cfClient'
+import { getCredentials } from '../core/shellEnv'
+import * as debugManager from '../core/debugManager'
+import * as logsManager from '../core/logsManager'
+import * as dbManager from '../core/dbManager'
+
+function post(v: vscode.Webview, msg: ExtensionMessage): void {
+  try { v.postMessage(msg) } catch {}
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+export class DebugPanelProvider implements vscode.WebviewViewProvider {
+  static readonly viewId = 'cdsTool.mainView'
+  private _view?: vscode.WebviewView
+  private _disposables: vscode.Disposable[] = []
+  private _credentialSource = ''
+  private _log: (type: string, msg: string) => void
+
+  constructor(logFn: (type: string, msg: string) => void) {
+    this._log = logFn
+  }
+
+  async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
+    this._view = view
+    view.webview.options = { enableScripts: true }
+    view.webview.html = this.getHtml()
+
+    view.webview.onDidReceiveMessage((msg: WebviewMessage) => this.handleMessage(msg))
+
+    for (const d of this._disposables) d.dispose()
+    this._disposables = []
+
+    const onStatus = (app: string, status: string) =>
+      post(view.webview, { type: 'SESSION_UPDATED', payload: { appName: app, status } })
+    debugManager.events.on('status', onStatus)
+    this._disposables.push(new vscode.Disposable(() => debugManager.events.off('status', onStatus)))
+
+    const onLogLine = (app: string, line: string) =>
+      post(view.webview, { type: 'LOGS_LINE', payload: { appName: app, line } })
+    logsManager.events.on('line', onLogLine)
+    this._disposables.push(new vscode.Disposable(() => logsManager.events.off('line', onLogLine)))
+
+    const onLogStatus = (app: string, streaming: boolean) =>
+      post(view.webview, { type: 'LOGS_STATUS', payload: { appName: app, streaming } })
+    logsManager.events.on('status', onLogStatus)
+    this._disposables.push(new vscode.Disposable(() => logsManager.events.off('status', onLogStatus)))
+
+    // Auto-detect credentials and send to webview
+    const creds = await getCredentials()
+    this._credentialSource = creds.email ? 'env' : 'none'
+    post(view.webview, {
+      type: 'CONFIG_LOADED',
+      payload: {
+        config: loadConfig(),
+        activeSessions: debugManager.getActiveSessions(),
+        credentialSource: this._credentialSource,
+        defaultEmail: creds.email,
+        defaultPassword: creds.password,
+      },
+    })
+  }
+
+  private async handleMessage(msg: WebviewMessage): Promise<void> {
+    const v = this._view
+    if (!v) return
+
+    switch (msg.type) {
+      case 'LOGIN': {
+        try {
+          const { apiEndpoint, email, password } = msg.payload
+          await cfLogin(apiEndpoint, email, password)
+          const orgs = await cfOrgs()
+          const config = loadConfig() ?? {
+            apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '',
+          }
+          config.apiEndpoint = apiEndpoint
+          config.orgs = orgs
+          saveConfig(config)
+          post(v.webview, { type: 'LOGIN_SUCCESS', payload: { orgs, apiEndpoint } })
+        } catch (err: any) {
+          post(v.webview, { type: 'LOGIN_ERROR', payload: { message: err.stderr || err.message } })
+        }
+        break
+      }
+
+      case 'LOAD_SPACES': {
+        try {
+          const org = msg.payload.org
+          await cfTargetOrg(org)
+          const spaces = await cfSpaces(org)
+          post(v.webview, { type: 'SPACES_LOADED', payload: { org, spaces } })
+        } catch (err: any) {
+          post(v.webview, { type: 'APPS_ERROR', payload: { message: err.message } })
+        }
+        break
+      }
+
+      case 'LOAD_APPS': {
+        try {
+          const apps = await cfApps(msg.payload.org, msg.payload.space)
+          post(v.webview, { type: 'APPS_LOADED', payload: { apps } })
+        } catch (err: any) {
+          post(v.webview, { type: 'APPS_ERROR', payload: { message: err.message } })
+        }
+        break
+      }
+
+      case 'START_DEBUG': {
+        const { appNames, org, space } = msg.payload
+        const ports: Record<string, number> = {}
+        for (const name of appNames) ports[name] = 9229
+        post(v.webview, { type: 'DEBUG_CONNECTING', payload: { appNames, ports } })
+        for (const appName of appNames) {
+          debugManager.startDebugSession(appName, org, space).catch((err: Error) => {
+            post(v.webview, {
+              type: 'APP_DEBUG_STATUS',
+              payload: { appName, status: 'ERROR', message: err.message },
+            })
+          })
+        }
+        break
+      }
+
+      case 'STOP_DEBUG':
+        await debugManager.stopDebugSession(msg.payload.appName)
+        break
+
+      case 'STOP_ALL_DEBUG':
+        await debugManager.stopAllDebugSessions()
+        break
+
+      case 'STREAM_LOGS': {
+        const { appName, action } = msg.payload
+        if (action === 'start') logsManager.startLogStream(appName)
+        else logsManager.stopLogStream(appName)
+        break
+      }
+
+      case 'LOAD_CONFIG':
+        post(v.webview, {
+          type: 'CONFIG_LOADED',
+          payload: {
+            config: loadConfig(),
+            activeSessions: debugManager.getActiveSessions(),
+          },
+        })
+        break
+
+      case 'GET_DB_CREDENTIALS': {
+        try {
+          const creds = await dbManager.getDbCredentials(
+            msg.payload.appName, msg.payload.org, msg.payload.space
+          )
+          post(v.webview, { type: 'DB_CREDENTIALS', payload: { creds, appName: msg.payload.appName } })
+        } catch (err: any) {
+          post(v.webview, { type: 'DB_ERROR', payload: { message: err.message } })
+        }
+        break
+      }
+
+      case 'ADD_DB_CONNECTION': {
+        try {
+          dbManager.addSqlToolsConnection(msg.payload.creds, msg.payload.appName)
+          await dbManager.saveCredentialsFile(msg.payload.creds, msg.payload.appName)
+          post(v.webview, { type: 'DB_CONNECTION_ADDED', payload: { appName: msg.payload.appName } })
+        } catch (err: any) {
+          post(v.webview, { type: 'DB_ERROR', payload: { message: err.message } })
+        }
+        break
+      }
+
+      case 'OPEN_APP':
+        vscode.env.openExternal(vscode.Uri.parse(msg.payload.url))
+        break
+
+      case 'RESET_LOGIN':
+        clearConfig()
+        await cfLogout()
+        break
+
+      case 'LOG':
+        this._log(msg.payload.level, msg.payload.message)
+        break
+    }
+  }
+
+  private getHtml(): string {
+    return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<style>
+:root{--bg:#1e1e1e;--fg:#ccc;--border:#333;--accent:#0078d4;--success:#4caf50;--error:#f44336;--warn:#ff9800}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:8px;color:var(--fg);background:var(--bg);font-size:13px;margin:0}
+.hidden{display:none!important}
+.section{margin-bottom:12px}
+h3{margin:8px 0 4px;font-size:13px;font-weight:600;color:#fff}
+label{display:block;margin:4px 0 2px;font-size:11px;color:#999}
+input,select,button{width:100%;box-sizing:border-box;margin:2px 0;padding:5px 8px;font-size:12px}
+input,select{background:#2d2d2d;border:1px solid var(--border);color:var(--fg);border-radius:2px}
+button{background:var(--accent);color:#fff;border:none;padding:6px 12px;cursor:pointer;border-radius:2px;font-weight:500}
+button:hover{opacity:.9}
+button:disabled{opacity:.4;cursor:default}
+.btn-danger{background:var(--error)}
+.btn-success{background:var(--success)}
+.btn-small{padding:2px 6px;font-size:11px;width:auto}
+.row{display:flex;gap:4px;align-items:center}
+.row button{flex:1}
+.app-item{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)}
+.app-item .name{flex:1;overflow:hidden;text-overflow:ellipsis}
+.state-started{color:var(--success);font-size:11px}
+.state-stopped{color:#666;font-size:11px}
+.state-empty{color:var(--warn);font-size:11px}
+.badge{font-size:10px;padding:1px 4px;border-radius:2px;background:#333;cursor:pointer}
+.log-line{font-family:monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid #2a2a2a;padding:1px 0}
+.log-container{max-height:300px;overflow-y:auto;background:#111;padding:4px;border-radius:2px;font-family:monospace;font-size:11px}
+.status-ATTACHED{color:var(--success);font-size:11px}
+.status-TUNNELING{color:var(--warn);font-size:11px}
+.status-SIGNALING{color:var(--warn);font-size:11px}
+.status-ERROR{color:var(--error);font-size:11px}
+.tab-bar{display:flex;gap:2px;margin-bottom:8px;position:sticky;top:0;background:var(--bg);z-index:1;padding:4px 0}
+.tab-bar button{flex:1;background:#2d2d2d;color:var(--fg);font-size:11px;padding:4px;border-radius:2px}
+.tab-bar button.active{background:var(--accent);color:#fff}
+.server-info{font-size:11px;color:#999;padding:4px;background:#2d2d2d;border-radius:2px;margin:4px 0;word-break:break-all}
+.pill{display:inline-block;font-size:10px;padding:1px 5px;border-radius:8px;margin:2px 0}
+.pill-env{background:var(--success);color:#fff}
+.pill-none{background:#666;color:#fff}
+.filter-input{margin:4px 0}
+#loadingOverlay{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px}
+#loadingOverlay.hidden{display:none}
+.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-text{font-size:12px;color:#999}
+
+</style>
+</head><body>
+<div id="loadingOverlay"><div class="spinner"></div><div class="loading-text">Loading CDS Tool...</div></div>
+
+<div class="tab-bar">
+  <button class="active" data-tab="login">Login</button>
+  <button data-tab="apps">Apps</button>
+  <button data-tab="debug">Debug</button>
+  <button data-tab="logs">Logs</button>
+  <button data-tab="db">DB</button>
+</div>
+
+<div id="tab-login" class="section">
+  <h3>Cloud Foundry Login</h3>
+  <label>API Endpoint</label>
+  <input id="apiEndpoint" placeholder="https://api.cf.us10.hana.ondemand.com">
+  <label>Email <span id="credSource" class="pill pill-none">manual</span></label>
+  <input type="email" id="email" placeholder="user@domain.com">
+  <label>Password</label>
+  <input type="password" id="password" placeholder="password">
+  <div class="row">
+    <button id="btnLogin">Login</button>
+    <button id="btnLogout" class="btn-danger btn-small">Logout</button>
+  </div>
+  <div id="loginStatus" class="server-info">Waiting for login...</div>
+</div>
+
+<div id="tab-apps" class="section hidden">
+  <h3>Organization &amp; Space</h3>
+  <select id="orgSelect"><option value="">Select org...</option></select>
+  <select id="spaceSelect"><option value="">Select space...</option></select>
+  <button id="btnRefreshApps" style="margin-top:4px">Refresh Apps</button>
+  <input id="appFilter" class="filter-input" placeholder="Filter apps...">
+  <h3>Applications</h3>
+  <div id="appsList"></div>
+</div>
+
+<div id="tab-debug" class="section hidden">
+  <h3>Debug Sessions</h3>
+  <div id="debugControls" class="hidden">
+    <button id="btnStartDebug" class="btn-success">Start Debug Selected</button>
+  </div>
+  <div id="sessionsList"></div>
+</div>
+
+<div id="tab-logs" class="section hidden">
+  <h3>Log Streaming</h3>
+  <select id="logAppSelect"><option value="">Select app...</option></select>
+  <div class="row">
+    <button id="btnStartLogs">Start</button>
+    <button id="btnStopLogs" class="btn-danger btn-small">Stop</button>
+    <button id="btnClearLogs" class="btn-small">Clear</button>
+  </div>
+  <div id="logContainer" class="log-container"></div>
+</div>
+
+<div id="tab-db" class="section hidden">
+  <h3>HANA Database</h3>
+  <select id="dbAppSelect"><option value="">Select app...</option></select>
+  <button id="btnGetDbCreds">Get DB Credentials</button>
+  <div id="dbInfo" class="server-info hidden"></div>
+  <button id="btnAddDb" class="btn-success hidden">Add SQLTools Connection</button>
+</div>
+
+<script>
+var vscode=acquireVsCodeApi()
+var apps=[],activeSessions={},allApps=[]
+
+function aLog(level,msg){vscode.postMessage({type:'LOG',payload:{level:level,message:msg}})}
+
+document.getElementById('loadingOverlay').classList.add('hidden')
+
+document.querySelectorAll('.tab-bar button').forEach(function(b){
+  b.addEventListener('click',function(){
+    var name=this.getAttribute('data-tab')
+    document.querySelectorAll('[id^="tab-"]').forEach(function(t){t.classList.add('hidden')})
+    document.querySelectorAll('.tab-bar button').forEach(function(x){x.classList.remove('active')})
+    document.getElementById('tab-'+name).classList.remove('hidden')
+    this.classList.add('active')
+  })
+})
+
+document.getElementById('btnLogin').addEventListener('click',function(){
+  var api=document.getElementById('apiEndpoint').value.trim()
+  var email=document.getElementById('email').value
+  var pw=document.getElementById('password').value
+  if(!api||!email||!pw){
+    document.getElementById('loginStatus').innerHTML='<span style="color:var(--error)">Fill in all fields</span>'
+    aLog('err','Fill in all fields');return
+  }
+  aLog('info','Logging in to '+api+'...')
+  document.getElementById('loginStatus').innerHTML='<span class="spinner" style="display:inline-block;vertical-align:middle;margin-right:4px"></span> Logging in...'
+  this.disabled=true
+  vscode.postMessage({type:'LOGIN',payload:{apiEndpoint:api,email:email,password:pw}})
+})
+
+document.getElementById('btnLogout').addEventListener('click',function(){
+  aLog('info','Logging out')
+  vscode.postMessage({type:'RESET_LOGIN'})
+  document.getElementById('loginStatus').textContent='Logged out'
+  document.getElementById('appsList').innerHTML=''
+  document.getElementById('sessionsList').innerHTML=''
+})
+
+document.getElementById('orgSelect').addEventListener('change',function(){
+  var org=this.value
+  if(!org)return
+  aLog('info','Loading spaces for '+org+'...')
+  document.getElementById('spaceSelect').innerHTML='<option>Loading...</option>'
+  document.getElementById('appsList').innerHTML=''
+  vscode.postMessage({type:'LOAD_SPACES',payload:{org:org}})
+})
+
+document.getElementById('btnRefreshApps').addEventListener('click',function(){
+  var org=document.getElementById('orgSelect').value
+  var space=document.getElementById('spaceSelect').value
+  if(!org||!space){aLog('warn','Select org and space first');return}
+  aLog('info','Loading apps for '+org+'/'+space+'...')
+  vscode.postMessage({type:'LOAD_APPS',payload:{org:org,space:space}})
+})
+
+document.getElementById('appFilter').addEventListener('input',function(){
+  var q=this.value.toLowerCase()
+  apps=q?allApps.filter(function(a){return a.name.toLowerCase().includes(q)}):allApps
+  renderApps(apps)
+})
+
+document.getElementById('btnStartDebug').addEventListener('click',function(){
+  var checked=Array.from(document.querySelectorAll('.app-check:checked')).map(function(cb){return cb.value})
+  if(!checked.length){aLog('warn','No apps selected');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  aLog('info','Starting debug for '+checked.length+' app(s): '+checked.join(', '))
+  vscode.postMessage({type:'START_DEBUG',payload:{appNames:checked,org:org,space:space}})
+})
+
+document.getElementById('btnStartLogs').addEventListener('click',function(){
+  var app=document.getElementById('logAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  aLog('info','Starting log stream for '+app)
+  document.getElementById('logContainer').innerHTML=''
+  vscode.postMessage({type:'STREAM_LOGS',payload:{appName:app,action:'start'}})
+})
+
+document.getElementById('btnStopLogs').addEventListener('click',function(){
+  var app=document.getElementById('logAppSelect').value
+  if(!app)return
+  aLog('info','Stopping log stream for '+app)
+  vscode.postMessage({type:'STREAM_LOGS',payload:{appName:app,action:'stop'}})
+})
+
+document.getElementById('btnClearLogs').addEventListener('click',function(){
+  document.getElementById('logContainer').innerHTML=''
+  aLog('info','Logs cleared')
+})
+
+document.getElementById('btnGetDbCreds').addEventListener('click',function(){
+  var app=document.getElementById('dbAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  document.getElementById('dbInfo').classList.add('hidden')
+  document.getElementById('btnAddDb').classList.add('hidden')
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  aLog('info','Getting DB credentials for '+app)
+  vscode.postMessage({type:'GET_DB_CREDENTIALS',payload:{appName:app,org:org,space:space}})
+})
+
+document.getElementById('btnAddDb').addEventListener('click',function(){
+  var creds=window.__lastDbCreds,app=window.__lastDbApp||document.getElementById('dbAppSelect').value
+  if(!creds)return
+  aLog('info','Adding SQLTools connection for '+app)
+  vscode.postMessage({type:'ADD_DB_CONNECTION',payload:{appName:app,creds:creds}})
+})
+
+window.addEventListener('message',function(e){
+  var msg=e.data
+  switch(msg.type){
+    case 'LOGIN_SUCCESS':
+      document.getElementById('btnLogin').disabled=false
+      document.getElementById('loginStatus').innerHTML='<span style="color:var(--success)">Connected to '+msg.payload.apiEndpoint+'</span>'
+      aLog('ok','Connected to '+msg.payload.apiEndpoint)
+      document.getElementById('orgSelect').innerHTML='<option value="">Loading...</option>'
+      populateOrgs(msg.payload.orgs)
+      showTab('apps')
+      break
+    case 'LOGIN_ERROR':
+      document.getElementById('btnLogin').disabled=false
+      document.getElementById('loginStatus').innerHTML='<span style="color:var(--error)">'+esc(msg.payload.message)+'</span>'
+      aLog('err','Login failed: '+msg.payload.message)
+      break
+    case 'SPACES_LOADED':{
+      var sel=document.getElementById('spaceSelect')
+      sel.innerHTML='<option value="">Select space...</option>'+msg.payload.spaces.map(function(s){return '<option value="'+esc(s)+'">'+esc(s)+'</option>'}).join('')
+      aLog('ok','Loaded '+msg.payload.spaces.length+' space(s)')
+      loadApps()
+      break
+    }
+    case 'APPS_LOADED':
+      allApps=msg.payload.apps
+      apps=allApps
+      renderApps(apps)
+      populateSelect('logAppSelect',apps)
+      populateSelect('dbAppSelect',apps)
+      aLog('ok','Loaded '+apps.length+' app(s)')
+      break
+    case 'APPS_ERROR':
+      document.getElementById('appsList').innerHTML='<div style="color:var(--error)">'+esc(msg.payload.message)+'</div>'
+      aLog('err',msg.payload.message)
+      break
+    case 'DEBUG_CONNECTING':
+      for(var i=0;i<msg.payload.appNames.length;i++)activeSessions[msg.payload.appNames[i]]='CONNECTING'
+      renderSessions()
+      showTab('debug')
+      aLog('info','Debug connecting: '+msg.payload.appNames.join(', '))
+      break
+    case 'SESSION_UPDATED':
+      activeSessions[msg.payload.appName]=msg.payload.status
+      renderSessions()
+      break
+    case 'APP_DEBUG_STATUS':
+      activeSessions[msg.payload.appName]=msg.payload.status
+      renderSessions()
+      aLog(msg.payload.status==='ATTACHED'?'ok':'warn',msg.payload.appName+': '+msg.payload.status+(msg.payload.message?': '+msg.payload.message:''))
+      break
+    case 'LOGS_LINE':{
+      var cont=document.getElementById('logContainer')
+      var div=document.createElement('div');div.className='log-line';div.textContent=msg.payload.line
+      cont.appendChild(div);cont.scrollTop=cont.scrollHeight
+      break
+    }
+    case 'CONFIG_LOADED':{
+      if(msg.payload.config){
+        var c=msg.payload.config
+        if(c.apiEndpoint){
+          document.getElementById('apiEndpoint').value=c.apiEndpoint
+        }
+        if(c.orgs&&c.orgs.length)populateOrgs(c.orgs)
+        if(c.lastOrg)setSelectValue('orgSelect',c.lastOrg)
+        if(c.lastSpace)setSelectValue('spaceSelect',c.lastSpace)
+      }
+      if(msg.payload.defaultEmail){
+        document.getElementById('email').value=msg.payload.defaultEmail
+      }
+      if(msg.payload.defaultPassword){
+        document.getElementById('password').value=msg.payload.defaultPassword
+      }
+      if(msg.payload.credentialSource==='env'){
+        document.getElementById('credSource').textContent='auto-detected'
+        document.getElementById('credSource').className='pill pill-env'
+      }
+      activeSessions={}
+      if(msg.payload.activeSessions)for(var i=0;i<msg.payload.activeSessions.length;i++)activeSessions[msg.payload.activeSessions[i]]='ATTACHED'
+      renderSessions()
+      aLog('info','Config loaded'+(msg.payload.credentialSource==='env'?' (auto-detected)':''))
+      break
+    }
+    case 'DB_CREDENTIALS':{
+      var div=document.getElementById('dbInfo'),btn=document.getElementById('btnAddDb')
+      window.__lastDbCreds=msg.payload.creds;window.__lastDbApp=msg.payload.appName
+      if(msg.payload.creds){
+        div.classList.remove('hidden')
+        div.innerHTML='<b>Host:</b> '+esc(msg.payload.creds.host)+':'+msg.payload.creds.port+'<br><b>DB:</b> '+esc(msg.payload.creds.database)+'<br><b>User:</b> '+esc(msg.payload.creds.user)
+        btn.classList.remove('hidden')
+        aLog('ok','DB credentials found for '+msg.payload.appName)
+      }else{div.classList.remove('hidden');div.textContent='No HANA credentials found';btn.classList.add('hidden');aLog('warn','No HANA credentials for '+msg.payload.appName)}
+      break
+    }
+    case 'DB_CONNECTION_ADDED':
+      document.getElementById('dbInfo').textContent='SQLTools connection added for '+msg.payload.appName
+      document.getElementById('btnAddDb').classList.add('hidden')
+      aLog('ok','SQLTools connection added for '+msg.payload.appName)
+      break
+    case 'DB_ERROR':
+      document.getElementById('dbInfo').classList.remove('hidden')
+      document.getElementById('dbInfo').innerHTML='<span style="color:var(--error)">'+esc(msg.payload.message)+'</span>'
+      aLog('err',msg.payload.message)
+      break
+  }
+})
+
+function showTab(name){
+  document.querySelectorAll('[id^="tab-"]').forEach(function(t){t.classList.add('hidden')})
+  document.querySelectorAll('.tab-bar button').forEach(function(b){b.classList.remove('active')})
+  document.getElementById('tab-'+name).classList.remove('hidden')
+  document.querySelector('.tab-bar button[data-tab="'+name+'"]').classList.add('active')
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function setSelectValue(id,val){
+  var sel=document.getElementById(id)
+  for(var i=0;i<sel.options.length;i++){if(sel.options[i].value===val){sel.value=val;break}}
+}
+function populateOrgs(orgs){
+  var sel=document.getElementById('orgSelect')
+  sel.innerHTML='<option value="">Select org...</option>'+orgs.map(function(o){return '<option value="'+esc(o)+'">'+esc(o)+'</option>'}).join('')
+  if(orgs.length==1){sel.value=orgs[0];loadSpaces()}
+}
+function loadApps(){
+  var org=document.getElementById('orgSelect').value
+  var space=document.getElementById('spaceSelect').value
+  if(!org||!space)return
+  vscode.postMessage({type:'LOAD_APPS',payload:{org:org,space:space}})
+}
+function renderApps(list){
+  var div=document.getElementById('appsList')
+  if(!list.length){div.innerHTML='<div class="server-info">No apps found</div>';return}
+  div.innerHTML=list.map(function(a){
+    var ch='<input type="checkbox" class="app-check" value="'+esc(a.name)+'">'
+    var url=a.urls&&a.urls.length?'<span class="badge" data-url="'+esc(a.urls[0])+'">URL</span>':''
+    return '<div class="app-item">'+ch+'<span class="name">'+esc(a.name)+'</span><span class="state-'+a.state+'">'+a.state+'</span>'+url+'</div>'
+  }).join('')
+  div.querySelectorAll('.app-check').forEach(function(cb){cb.addEventListener('change',updateDebugBtn)})
+  div.querySelectorAll('.badge').forEach(function(el){el.addEventListener('click',function(){vscode.postMessage({type:'OPEN_APP',payload:{url:this.getAttribute('data-url')}})})})
+  updateDebugBtn()
+}
+function updateDebugBtn(){
+  var checked=document.querySelectorAll('.app-check:checked')
+  var btn=document.getElementById('btnStartDebug')
+  var parent=document.getElementById('debugControls')
+  if(checked.length){parent.classList.remove('hidden');btn.textContent='Debug ('+checked.length+')'}
+  else parent.classList.add('hidden')
+}
+function renderSessions(){
+  var div=document.getElementById('sessionsList')
+  var keys=Object.keys(activeSessions)
+  if(!keys.length){div.innerHTML='<div class="server-info">No active sessions</div>';return}
+  div.innerHTML=keys.map(function(app){
+    var s=activeSessions[app]
+    return '<div class="app-item"><span class="name">'+esc(app)+'</span><span class="status-'+s+'">'+s+'</span><button class="btn-small btn-danger" data-app="'+esc(app)+'">Stop</button></div>'
+  }).join('')
+  div.querySelectorAll('.btn-danger').forEach(function(el){el.addEventListener('click',function(){
+    vscode.postMessage({type:'STOP_DEBUG',payload:{appName:this.getAttribute('data-app')}})
+  })})
+}
+function populateSelect(id,list){
+  var sel=document.getElementById(id)
+  sel.innerHTML='<option value="">Select app...</option>'+list.map(function(a){return '<option value="'+esc(a.name)+'">'+esc(a.name)+'</option>'}).join('')
+}
+vscode.postMessage({type:'LOAD_CONFIG'})
+</script>
+</body></html>`
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "name": "cds-tool",
+  "displayName": "CDS Tool",
+  "description": "Debug CAP on Cloud Foundry, stream logs, query HANA database — all from VS Code",
+  "version": "1.0.0",
+  "publisher": "cds-tool",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CDS-Tool/cds-tool.git"
+  },
+  "homepage": "https://github.com/CDS-Tool/cds-tool",
+  "engines": {
+    "vscode": "^1.116.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cds-tool",
+          "title": "CDS Tool",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "cds-tool": [
+        {
+          "type": "webview",
+          "id": "cdsTool.mainView",
+          "name": "CDS Tool"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "cdsTool.login",
+        "title": "CDS Tool: Open Panel"
+      },
+      {
+        "command": "cdsTool.logs",
+        "title": "CDS Tool: Stream App Logs (Output Channel)"
+      },
+      {
+        "command": "cdsTool.addDbConnection",
+        "title": "CDS Tool: Add Database Connection (SQLTools)"
+      },
+      {
+        "command": "cdsTool.openApp",
+        "title": "CDS Tool: Open App in Browser"
+      }
+    ],
+    "configuration": {
+      "title": "CDS Tool",
+      "properties": {
+        "cdsTool.remoteRoot": {
+          "type": "string",
+          "default": "/home/vcap/app",
+          "markdownDescription": "Remote root path used in debug attach config"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.mjs",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "package": "vsce package --no-dependencies",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.116.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
+  }
+}
