@@ -1,8 +1,9 @@
 import * as vscode from 'vscode'
 import type { WebviewMessage, ExtensionMessage } from '../types'
-import { saveConfig, loadConfig, clearConfig } from '../storage/store'
+import { saveConfig, loadConfig, clearConfig, saveEmail, loadFolderMappings, saveFolderMappings, setCachedApps, getCachedApps, loadCachedRegions } from '../storage/store'
 import { cfLogin, cfOrgs, cfTargetOrg, cfSpaces, cfApps, cfLogout } from '../core/cfClient'
 import { getCredentials } from '../core/shellEnv'
+import * as packageBrowser from '../core/packageBrowser'
 import * as debugManager from '../core/debugManager'
 import * as logsManager from '../core/logsManager'
 import * as dbManager from '../core/dbManager'
@@ -77,11 +78,13 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
           await cfLogin(apiEndpoint, email, password)
           const orgs = await cfOrgs()
           const config = loadConfig() ?? {
-            apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '',
+            apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '', remoteRoot: '/home/vcap/app',
           }
           config.apiEndpoint = apiEndpoint
           config.orgs = orgs
           saveConfig(config)
+          await saveEmail(email)
+          this._log('info', `Email saved to secret storage`)
           post(v.webview, { type: 'LOGIN_SUCCESS', payload: { orgs, apiEndpoint } })
         } catch (err: any) {
           post(v.webview, { type: 'LOGIN_ERROR', payload: { message: err.stderr || err.message } })
@@ -103,8 +106,20 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
 
       case 'LOAD_APPS': {
         try {
-          const apps = await cfApps(msg.payload.org, msg.payload.space)
-          post(v.webview, { type: 'APPS_LOADED', payload: { apps } })
+          const { org, space, force } = msg.payload
+          const config = loadConfig()
+          const apiEndpoint = config?.apiEndpoint ?? ''
+          // Check cache first unless force refresh
+          if (!force) {
+            const cached = getCachedApps(apiEndpoint, org, space)
+            if (cached) {
+              post(v.webview, { type: 'APPS_LOADED', payload: { apps: cached, fromCache: true } })
+              break
+            }
+          }
+          const apps = await cfApps(org, space)
+          setCachedApps(apiEndpoint, org, space, apps)
+          post(v.webview, { type: 'APPS_LOADED', payload: { apps, fromCache: false } })
         } catch (err: any) {
           post(v.webview, { type: 'APPS_ERROR', payload: { message: err.message } })
         }
@@ -148,6 +163,8 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
           payload: {
             config: loadConfig(),
             activeSessions: debugManager.getActiveSessions(),
+            cachedRegions: loadCachedRegions(),
+            folderMappings: loadFolderMappings(),
           },
         })
         break
@@ -187,6 +204,57 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
       case 'LOG':
         this._log(msg.payload.level, msg.payload.message)
         break
+
+      case 'LOAD_SETTINGS':
+        post(v.webview, {
+          type: 'SETTINGS_LOADED',
+          payload: {
+            remoteRoot: loadConfig()?.remoteRoot ?? '/home/vcap/app',
+            folderMappings: loadFolderMappings(),
+          },
+        })
+        break
+
+      case 'SAVE_SETTINGS': {
+        const cfg = loadConfig() ?? {
+          apiEndpoint: '', orgs: [], orgGroupMappings: [], lastOrg: '', lastSpace: '', remoteRoot: '/home/vcap/app',
+        }
+        cfg.remoteRoot = msg.payload.remoteRoot
+        saveConfig(cfg)
+        this._log('info', 'Settings saved')
+        break
+      }
+
+      case 'BROWSE_PACKAGES': {
+        try {
+          const { appName, org, space } = msg.payload
+          const packages = await packageBrowser.listRemotePackages(appName, org, space)
+          post(v.webview, {
+            type: 'PACKAGES_LOADED',
+            payload: { appName, packages, error: packages.length ? undefined : 'No packages found' },
+          })
+        } catch (err: any) {
+          post(v.webview, {
+            type: 'PACKAGES_LOADED',
+            payload: { appName: msg.payload.appName, packages: [], error: err.message },
+          })
+        }
+        break
+      }
+
+      case 'BROWSE_FILE': {
+        try {
+          const { appName, path } = msg.payload
+          const content = await packageBrowser.readRemoteFile(appName, '', '', path)
+          post(v.webview, {
+            type: 'FILE_CONTENT',
+            payload: { appName, path, content },
+          })
+        } catch (err: any) {
+          this._log('err', `Browse file error: ${err.message}`)
+        }
+        break
+      }
     }
   }
 
@@ -292,6 +360,7 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
   <button data-tab="debug">Debug</button>
   <button data-tab="logs">Logs</button>
   <button data-tab="db">DB</button>
+  <button data-tab="settings">&#9881;</button>
 </div>
 
 <div id="tab-login" class="section">
@@ -360,6 +429,24 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
   </div>
 </div>
 
+<div id="tab-settings" class="section hidden">
+  <div class="section-card">
+    <h3>Settings</h3>
+    <label>Remote Root Path</label>
+    <input id="remoteRoot" value="/home/vcap/app" placeholder="/home/vcap/app">
+    <label>Folder Mappings</label>
+    <div id="folderMappings"></div>
+    <button id="btnAddMapping" class="btn-small btn-outline" style="margin-top:4px">+ Add Mapping</button>
+    <button id="btnSaveSettings" class="btn-success" style="margin-top:8px">Save Settings</button>
+    <div id="settingsStatus" class="server-info hidden"></div>
+  </div>
+  <div class="section-card">
+    <h3>Cache</h3>
+    <div id="cacheInfo" class="server-info">No cached data</div>
+    <button id="btnClearCache" class="btn-small btn-danger">Clear Cache</button>
+  </div>
+</div>
+
 <script>
 var vscode=acquireVsCodeApi()
 var apps=[],activeSessions={},allApps=[]
@@ -407,6 +494,19 @@ document.getElementById('orgSelect').addEventListener('change',function(){
   document.getElementById('spaceSelect').innerHTML='<option>Loading...</option>'
   document.getElementById('appsList').innerHTML=''
   vscode.postMessage({type:'LOAD_SPACES',payload:{org:org}})
+})
+
+document.getElementById('btnSaveSettings').addEventListener('click',function(){
+  var root=document.getElementById('remoteRoot').value.trim()
+  vscode.postMessage({type:'SAVE_SETTINGS',payload:{remoteRoot:root}})
+  document.getElementById('settingsStatus').classList.remove('hidden')
+  document.getElementById('settingsStatus').innerHTML='<span style="color:var(--success)">Settings saved</span>'
+  aLog('ok','Settings saved')
+})
+document.getElementById('btnClearCache').addEventListener('click',function(){
+  vscode.postMessage({type:'RESET_LOGIN'})
+  document.getElementById('cacheInfo').innerHTML='Cache cleared'
+  aLog('info','Cache cleared')
 })
 
 document.getElementById('spaceSelect').addEventListener('change',function(){
@@ -508,7 +608,7 @@ window.addEventListener('message',function(e){
       renderApps(apps)
       populateSelect('logAppSelect',apps)
       populateSelect('dbAppSelect',apps)
-      aLog('ok','Loaded '+apps.length+' app(s)')
+      aLog(msg.payload.fromCache?'info':'ok','Loaded '+apps.length+' app(s)'+(msg.payload.fromCache?' (from cache)':''))
       break
     case 'APPS_ERROR':
       document.getElementById('appsList').innerHTML='<div style="color:var(--error)">'+esc(msg.payload.message)+'</div>'
@@ -544,6 +644,7 @@ window.addEventListener('message',function(e){
         if(c.orgs&&c.orgs.length)populateOrgs(c.orgs)
         if(c.lastOrg)setSelectValue('orgSelect',c.lastOrg)
         if(c.lastSpace)setSelectValue('spaceSelect',c.lastSpace)
+        if(c.remoteRoot)document.getElementById('remoteRoot').value=c.remoteRoot
       }
       if(msg.payload.defaultEmail){
         document.getElementById('email').value=msg.payload.defaultEmail
@@ -555,10 +656,43 @@ window.addEventListener('message',function(e){
         document.getElementById('credSource').textContent='auto-detected'
         document.getElementById('credSource').className='pill pill-env'
       }
+      // Show cache info
+      var cacheDiv=document.getElementById('cacheInfo')
+      if(msg.payload.cachedRegions&&msg.payload.cachedRegions.length){
+        var total=0;msg.payload.cachedRegions.forEach(function(r){r.orgs.forEach(function(o){total+=o.spaces.length})})
+        cacheDiv.innerHTML='<span style="color:var(--success)">&#9679;</span> '+msg.payload.cachedRegions.length+' region(s), '+total+' space(s) cached'
+      }else{cacheDiv.innerHTML='No cached data'}
+      // Show folder mappings
+      if(msg.payload.folderMappings&&msg.payload.folderMappings.length){
+        var fm=document.getElementById('folderMappings')
+        fm.innerHTML=msg.payload.folderMappings.map(function(m,i){
+          return '<div style="font-size:11px;padding:3px 0;display:flex;align-items:center;gap:4px"><span style="flex:1">'+esc(m.cfOrg)+'/'+esc(m.cfSpace)+'</span><span style="color:var(--text-muted)">'+esc(m.groupFolderPath)+'</span></div>'
+        }).join('')
+      }
       activeSessions={}
       if(msg.payload.activeSessions)for(var i=0;i<msg.payload.activeSessions.length;i++)activeSessions[msg.payload.activeSessions[i]]='ATTACHED'
       renderSessions()
       aLog('info','Config loaded'+(msg.payload.credentialSource==='env'?' (auto-detected)':''))
+      break
+    }
+
+    case 'SETTINGS_LOADED':{
+      if(msg.payload.remoteRoot)document.getElementById('remoteRoot').value=msg.payload.remoteRoot
+      var fm=document.getElementById('folderMappings')
+      if(msg.payload.folderMappings&&msg.payload.folderMappings.length){
+        fm.innerHTML=msg.payload.folderMappings.map(function(m){
+          return '<div style="font-size:11px;padding:3px 0;display:flex;align-items:center;gap:4px"><span style="flex:1">'+esc(m.cfOrg)+'/'+esc(m.cfSpace)+'</span><span style="color:var(--text-muted)">'+esc(m.groupFolderPath)+'</span></div>'
+        }).join('')
+      }
+      break
+    }
+
+    case 'PACKAGES_LOADED':{
+      if(msg.payload.error){
+        aLog('err','Browse packages: '+msg.payload.error)
+      }else{
+        aLog('ok','Found '+msg.payload.packages.length+' packages in '+msg.payload.appName)
+      }
       break
     }
     case 'DB_CREDENTIALS':{
