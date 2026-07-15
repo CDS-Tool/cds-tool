@@ -194,48 +194,57 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
     return `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
-:root{--bg:#1e1e1e;--fg:#ccc;--border:#333;--accent:#0078d4;--success:#4caf50;--error:#f44336;--warn:#ff9800}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:8px;color:var(--fg);background:var(--bg);font-size:13px;margin:0}
+:root{--bg:#1e1e1e;--fg:#d4d4d4;--border:#3c3c3c;--accent:#0078d4;--accent-hover:#1a8ae8;--success:#4caf50;--error:#f44747;--warn:#ff8c00;--card:#252526;--card-hover:#2a2d2e;--input-bg:#3c3c3c;--text-muted:#858585}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:12px;color:var(--fg);background:var(--bg);font-size:13px;margin:0;line-height:1.5}
 .hidden{display:none!important}
-.section{margin-bottom:12px}
-h3{margin:8px 0 4px;font-size:13px;font-weight:600;color:#fff}
-label{display:block;margin:4px 0 2px;font-size:11px;color:#999}
-input,select,button{width:100%;box-sizing:border-box;margin:2px 0;padding:5px 8px;font-size:12px}
-input,select{background:#2d2d2d;border:1px solid var(--border);color:var(--fg);border-radius:2px}
-button{background:var(--accent);color:#fff;border:none;padding:6px 12px;cursor:pointer;border-radius:2px;font-weight:500}
-button:hover{opacity:.9}
-button:disabled{opacity:.4;cursor:default}
+.section{margin-bottom:16px}
+h3{margin:12px 0 8px;font-size:12px;font-weight:600;color:var(--fg);text-transform:uppercase;letter-spacing:.5px}
+label{display:block;margin:6px 0 3px;font-size:11px;color:var(--text-muted);font-weight:500}
+input,select,button{width:100%;box-sizing:border-box;margin:3px 0;padding:6px 10px;font-size:12.5px}
+input,select{background:var(--input-bg);border:1px solid var(--border);color:var(--fg);border-radius:4px;transition:border-color .15s}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input::placeholder{color:var(--text-muted)}
+button{background:var(--accent);color:#fff;border:none;padding:7px 14px;cursor:pointer;border-radius:4px;font-weight:500;transition:background .15s}
+button:hover{background:var(--accent-hover)}
+button:active{transform:scale(.98)}
+button:disabled{opacity:.4;cursor:default;transform:none}
 .btn-danger{background:var(--error)}
+.btn-danger:hover{background:#e35f5f}
 .btn-success{background:var(--success)}
-.btn-small{padding:2px 6px;font-size:11px;width:auto}
-.row{display:flex;gap:4px;align-items:center}
+.btn-success:hover{background:#5dbc5e}
+.btn-small{padding:3px 8px;font-size:11px;width:auto;border-radius:3px}
+.row{display:flex;gap:6px;align-items:center}
 .row button{flex:1}
-.app-item{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border)}
-.app-item .name{flex:1;overflow:hidden;text-overflow:ellipsis}
-.state-started{color:var(--success);font-size:11px}
-.state-stopped{color:#666;font-size:11px}
+.app-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-bottom:1px solid var(--border);transition:background .1s;border-radius:3px}
+.app-item:hover{background:var(--card-hover)}
+.app-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;font-size:12.5px}
+.state-started{color:var(--success);font-size:11px;font-weight:500}
+.state-stopped{color:var(--text-muted);font-size:11px}
 .state-empty{color:var(--warn);font-size:11px}
-.badge{font-size:10px;padding:1px 4px;border-radius:2px;background:#333;cursor:pointer}
-.log-line{font-family:monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid #2a2a2a;padding:1px 0}
-.log-container{max-height:300px;overflow-y:auto;background:#111;padding:4px;border-radius:2px;font-family:monospace;font-size:11px}
-.status-ATTACHED{color:var(--success);font-size:11px}
+.badge{font-size:10px;padding:2px 6px;border-radius:3px;background:var(--input-bg);cursor:pointer;transition:background .15s}
+.badge:hover{background:var(--accent);color:#fff}
+.log-line{font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;white-space:pre-wrap;word-break:break-all;border-bottom:1px solid rgba(255,255,255,.04);padding:2px 0}
+.log-container{max-height:300px;overflow-y:auto;background:#0d0d0d;padding:6px;border-radius:4px;font-family:'Cascadia Code','Fira Code','JetBrains Mono',monospace;font-size:11px;border:1px solid var(--border)}
+.status-ATTACHED{color:var(--success);font-size:11px;font-weight:500}
 .status-TUNNELING{color:var(--warn);font-size:11px}
 .status-SIGNALING{color:var(--warn);font-size:11px}
 .status-ERROR{color:var(--error);font-size:11px}
-.tab-bar{display:flex;gap:2px;margin-bottom:8px;position:sticky;top:0;background:var(--bg);z-index:1;padding:4px 0}
-.tab-bar button{flex:1;background:#2d2d2d;color:var(--fg);font-size:11px;padding:4px;border-radius:2px}
-.tab-bar button.active{background:var(--accent);color:#fff}
-.server-info{font-size:11px;color:#999;padding:4px;background:#2d2d2d;border-radius:2px;margin:4px 0;word-break:break-all}
-.pill{display:inline-block;font-size:10px;padding:1px 5px;border-radius:8px;margin:2px 0}
+.tab-bar{display:flex;gap:1px;margin-bottom:12px;position:sticky;top:0;background:var(--bg);z-index:1;padding:6px 0 0;border-bottom:1px solid var(--border)}
+.tab-bar button{flex:1;background:transparent;color:var(--text-muted);font-size:11.5px;padding:6px 4px;border-radius:0;border-bottom:2px solid transparent;margin:0;transition:color .15s,border-color .15s}
+.tab-bar button:hover{background:transparent;color:var(--fg)}
+.tab-bar button.active{background:transparent;color:var(--fg);border-bottom-color:var(--accent);font-weight:600}
+.server-info{font-size:11.5px;color:var(--text-muted);padding:8px 10px;background:var(--card);border-radius:4px;margin:6px 0;word-break:break-all;border:1px solid var(--border)}
+.pill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:10px;margin:2px 0;font-weight:500}
 .pill-env{background:var(--success);color:#fff}
-.pill-none{background:#666;color:#fff}
+.pill-none{background:var(--text-muted);color:#fff}
 .filter-input{margin:4px 0}
-#loadingOverlay{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px}
+.section-card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:12px}
+#loadingOverlay{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
 #loadingOverlay.hidden{display:none}
-.spinner{width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+.spinner{width:18px;height:18px;border:2.5px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
 @keyframes spin{to{transform:rotate(360deg)}}
-.loading-text{font-size:12px;color:#999}
-
+.loading-text{font-size:13px;color:var(--text-muted)}
+.app-check{width:auto;margin:0;accent-color:var(--accent);cursor:pointer}
 </style>
 </head><body>
 <div id="loadingOverlay"><div class="spinner"></div><div class="loading-text">Loading CDS Tool...</div></div>
@@ -249,55 +258,69 @@ button:disabled{opacity:.4;cursor:default}
 </div>
 
 <div id="tab-login" class="section">
-  <h3>Cloud Foundry Login</h3>
-  <label>API Endpoint</label>
-  <input id="apiEndpoint" placeholder="https://api.cf.us10.hana.ondemand.com">
-  <label>Email <span id="credSource" class="pill pill-none">manual</span></label>
-  <input type="email" id="email" placeholder="user@domain.com">
-  <label>Password</label>
-  <input type="password" id="password" placeholder="password">
-  <div class="row">
-    <button id="btnLogin">Login</button>
-    <button id="btnLogout" class="btn-danger btn-small">Logout</button>
+  <div class="section-card">
+    <h3>Cloud Foundry Login</h3>
+    <label>API Endpoint</label>
+    <input id="apiEndpoint" placeholder="https://api.cf.us10.hana.ondemand.com">
+    <label>Email <span id="credSource" class="pill pill-none">manual</span></label>
+    <input type="email" id="email" placeholder="user@domain.com">
+    <label>Password</label>
+    <input type="password" id="password" placeholder="password">
+    <div class="row" style="margin-top:8px">
+      <button id="btnLogin">Login</button>
+      <button id="btnLogout" class="btn-danger btn-small">Logout</button>
+    </div>
+    <div id="loginStatus" class="server-info" style="margin-top:8px">Waiting for login...</div>
   </div>
-  <div id="loginStatus" class="server-info">Waiting for login...</div>
 </div>
 
 <div id="tab-apps" class="section hidden">
-  <h3>Organization &amp; Space</h3>
-  <select id="orgSelect"><option value="">Select org...</option></select>
-  <select id="spaceSelect"><option value="">Select space...</option></select>
-  <button id="btnRefreshApps" style="margin-top:4px">Refresh Apps</button>
-  <input id="appFilter" class="filter-input" placeholder="Filter apps...">
-  <h3>Applications</h3>
-  <div id="appsList"></div>
+  <div class="section-card">
+    <h3>Organization &amp; Space</h3>
+    <select id="orgSelect"><option value="">Select org...</option></select>
+    <select id="spaceSelect"><option value="">Select space...</option></select>
+    <button id="btnRefreshApps" style="margin-top:6px">Refresh Apps</button>
+    <input id="appFilter" class="filter-input" placeholder="Filter apps...">
+  </div>
+  <div class="section-card">
+    <h3>Applications</h3>
+    <div id="appsList"></div>
+  </div>
 </div>
 
 <div id="tab-debug" class="section hidden">
-  <h3>Debug Sessions</h3>
-  <div id="debugControls" class="hidden">
-    <button id="btnStartDebug" class="btn-success">Start Debug Selected</button>
+  <div class="section-card">
+    <h3>Debug Sessions</h3>
+    <div id="debugControls" class="hidden">
+      <button id="btnStartDebug" class="btn-success">Start Debug Selected</button>
+    </div>
+    <div id="sessionsList"></div>
   </div>
-  <div id="sessionsList"></div>
 </div>
 
 <div id="tab-logs" class="section hidden">
-  <h3>Log Streaming</h3>
-  <select id="logAppSelect"><option value="">Select app...</option></select>
-  <div class="row">
-    <button id="btnStartLogs">Start</button>
-    <button id="btnStopLogs" class="btn-danger btn-small">Stop</button>
-    <button id="btnClearLogs" class="btn-small">Clear</button>
+  <div class="section-card">
+    <h3>Log Streaming</h3>
+    <select id="logAppSelect"><option value="">Select app...</option></select>
+    <div class="row">
+      <button id="btnStartLogs">Start</button>
+      <button id="btnStopLogs" class="btn-danger btn-small">Stop</button>
+      <button id="btnClearLogs" class="btn-small">Clear</button>
+    </div>
   </div>
-  <div id="logContainer" class="log-container"></div>
+  <div class="section-card">
+    <div id="logContainer" class="log-container"></div>
+  </div>
 </div>
 
 <div id="tab-db" class="section hidden">
-  <h3>HANA Database</h3>
-  <select id="dbAppSelect"><option value="">Select app...</option></select>
-  <button id="btnGetDbCreds">Get DB Credentials</button>
-  <div id="dbInfo" class="server-info hidden"></div>
-  <button id="btnAddDb" class="btn-success hidden">Add SQLTools Connection</button>
+  <div class="section-card">
+    <h3>HANA Database</h3>
+    <select id="dbAppSelect"><option value="">Select app...</option></select>
+    <button id="btnGetDbCreds">Get DB Credentials</button>
+    <div id="dbInfo" class="server-info hidden"></div>
+    <button id="btnAddDb" class="btn-success hidden">Add SQLTools Connection</button>
+  </div>
 </div>
 
 <script>
