@@ -5,11 +5,14 @@ import { stopAllDebugSessions, disposeDebugManager } from './core/debugManager'
 import { stopAllLogStreams } from './core/logsManager'
 import { cfLogout } from './core/cfClient'
 import { initActivityLog, log as activityLog } from './core/activityLog'
+import { initWatchdog, showWatchdogPanel, disposeWatchdog, watchApp, unwatchApp } from './core/watchdog'
 
 export function activate(context: vscode.ExtensionContext): void {
   initStore(context)
   const _activityChannel = initActivityLog()
   context.subscriptions.push(_activityChannel)
+
+  initWatchdog(activityLog)
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -102,11 +105,70 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     })
   )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cdsTool.showWatchdog', showWatchdogPanel)
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cdsTool.syncOrg', async () => {
+      const { runFullSync, readSyncManifest } = await import('./core/cfSync')
+      const creds = await (await import('./core/shellEnv')).getCredentials()
+      if (!creds.email || !creds.password) {
+        vscode.window.showErrorMessage('Set SAP_EMAIL and SAP_PASSWORD in your environment')
+        return
+      }
+      const manifest = readSyncManifest()
+      const regions = manifest.regions.map(r => r.key)
+      if (regions.length === 0) {
+        const pick = await vscode.window.showQuickPick(
+          (await import('./core/regions')).CF_REGIONS.map(r => ({ label: r.label, description: r.key })),
+          { canPickMany: true, placeHolder: 'Select regions to sync' }
+        )
+        if (!pick || pick.length === 0) return
+        const keys = pick.map(p => p.description!)
+        await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Syncing CF landscape...' },
+          async (progress) => {
+            progress.report({ message: 'Starting...' })
+            await runFullSync(creds.email!, creds.password!, keys, (msg) => progress.report({ message: msg }))
+          }
+        )
+      } else {
+        await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Syncing CF landscape...' },
+          async (progress) => {
+            await runFullSync(creds.email!, creds.password!, regions, (msg) => progress.report({ message: msg }))
+          }
+        )
+      }
+      vscode.window.showInformationMessage('CF landscape sync complete')
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cdsTool.getToken', async () => {
+      const app = await vscode.window.showInputBox({ prompt: 'CF App name' })
+      if (!app) return
+      const org = await vscode.window.showInputBox({ prompt: 'CF Org' })
+      if (!org) return
+      const space = await vscode.window.showInputBox({ prompt: 'CF Space' })
+      if (!space) return
+      try {
+        const token = await (await import('./core/xsuaa')).getTokenCached(app, org, space, activityLog)
+        if (token) {
+          vscode.env.clipboard.writeText(token)
+          vscode.window.showInformationMessage('XSUAA token copied to clipboard')
+        }
+      } catch (err: any) {
+        vscode.window.showErrorMessage(err.message)
+      }
+    })
+  )
 }
 
 export async function deactivate(): Promise<void> {
   await stopAllDebugSessions()
   stopAllLogStreams()
   disposeDebugManager()
+  disposeWatchdog()
   await cfLogout().catch(() => {})
 }

@@ -298,6 +298,81 @@ export class DebugPanelProvider implements vscode.WebviewViewProvider {
         }
         break
       }
+
+      case 'GET_XSUAA_TOKEN': {
+        try {
+          const { appName, org, space } = msg.payload
+          const { getTokenCached } = await import('../core/xsuaa')
+          const token = await getTokenCached(appName, org, space, this._log)
+          if (token) {
+            post(v.webview, { type: 'XSUAA_TOKEN_RESPONSE', payload: { token, expiresIn: 3600 } })
+          } else {
+            post(v.webview, { type: 'XSUAA_TOKEN_RESPONSE', payload: { error: 'No token obtained' } })
+          }
+        } catch (err: any) {
+          post(v.webview, { type: 'XSUAA_TOKEN_RESPONSE', payload: { error: err.message } })
+        }
+        break
+      }
+
+      case 'SHOW_WATCHDOG': {
+        const { showWatchdogPanel } = await import('../core/watchdog')
+        showWatchdogPanel()
+        break
+      }
+
+      case 'SYNC_LANDSCAPE': {
+        try {
+          const { getCredentials } = await import('../core/shellEnv')
+          const creds = await getCredentials()
+          if (!creds.email || !creds.password) {
+            post(v.webview, { type: 'SYNC_STATUS', payload: { message: '<span style="color:var(--error)">Set SAP_EMAIL and SAP_PASSWORD in environment</span>' } })
+            break
+          }
+          const { runFullSync } = await import('../core/cfSync')
+          post(v.webview, { type: 'SYNC_STATUS', payload: { message: 'Syncing landscape...' } })
+          await runFullSync(creds.email, creds.password, undefined, (msg) => {
+            post(v.webview, { type: 'SYNC_STATUS', payload: { message: esc(msg) } })
+          })
+          post(v.webview, { type: 'SYNC_STATUS', payload: { message: '<span style="color:var(--success)">Sync complete</span>' } })
+        } catch (err: any) {
+          post(v.webview, { type: 'SYNC_STATUS', payload: { message: `<span style="color:var(--error)">${esc(err.message)}</span>` } })
+        }
+        break
+      }
+
+      case 'EXPLORER_LS': {
+        try {
+          const { appName, org, space, dir } = msg.payload
+          const result = await packageBrowser.lsRemote(appName, org, space, dir)
+          post(v.webview, { type: 'EXPLORER_RESULT', payload: { result } })
+        } catch (err: any) {
+          post(v.webview, { type: 'EXPLORER_RESULT', payload: { error: err.message } })
+        }
+        break
+      }
+
+      case 'EXPLORER_FIND': {
+        try {
+          const { appName, org, space, dir, query } = msg.payload
+          const result = await packageBrowser.findRemoteFiles(appName, org, space, query, dir)
+          post(v.webview, { type: 'EXPLORER_RESULT', payload: { result } })
+        } catch (err: any) {
+          post(v.webview, { type: 'EXPLORER_RESULT', payload: { error: err.message } })
+        }
+        break
+      }
+
+      case 'EXPLORER_GREP': {
+        try {
+          const { appName, org, space, query } = msg.payload
+          const result = await packageBrowser.grepRemote(appName, org, space, query)
+          post(v.webview, { type: 'EXPLORER_RESULT', payload: { result: result.map(r => `${r.path}: ${r.line}`) } })
+        } catch (err: any) {
+          post(v.webview, { type: 'EXPLORER_RESULT', payload: { error: err.message } })
+        }
+        break
+      }
     }
   }
 
@@ -410,7 +485,8 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
   <div class="section-card">
     <h3>Cloud Foundry Login</h3>
     <div id="cfLoggedInBanner" class="server-info hidden" style="background:var(--card-hover);border-left:3px solid var(--success);margin-bottom:8px"></div>
-    <label>Region / API Endpoint</label>
+    <label>Region</label>
+    <div id="regionGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:6px"></div>
     <div class="row" style="gap:4px">
       <select id="regionSelect" style="flex:1">
         <option value="">Custom...</option>
@@ -458,6 +534,12 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <button id="btnGenLaunchConfig" class="btn-small btn-outline">Generate launch.json</button>
     <div id="launchConfigStatus" class="server-info hidden" style="margin-top:6px"></div>
   </div>
+  <div class="section-card">
+    <h3>App Watchdog</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Monitors debugged apps every 90s. Alerts if unresponsive.</p>
+    <div id="watchdogStatus" class="server-info">No apps watched</div>
+    <button id="btnShowWatchdog" class="btn-small btn-outline">Show Watchdog</button>
+  </div>
 </div>
 
 <div id="tab-logs" class="section hidden">
@@ -484,10 +566,33 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <button id="btnAddDb" class="btn-success hidden">Add SQLTools Connection</button>
   </div>
   <div class="section-card">
+    <h3>XSUAA Token</h3>
+    <select id="xsuaaAppSelect"><option value="">Select app...</option></select>
+    <button id="btnGetToken">Get XSUAA Token</button>
+    <div id="tokenStatus" class="server-info hidden"></div>
+  </div>
+  <div class="section-card">
     <h3>Package Browser</h3>
     <select id="pkgAppSelect"><option value="">Select app...</option></select>
+    <div class="row" style="gap:4px">
+      <input id="pkgRegexFilter" class="filter-input" placeholder="Filter by regex (e.g. @sap/)" style="flex:1">
+    </div>
     <button id="btnBrowsePkg">Browse package.json files</button>
     <div id="pkgList" class="server-info hidden"></div>
+  </div>
+  <div class="section-card">
+    <h3>Remote Explorer</h3>
+    <select id="explorerAppSelect"><option value="">Select app...</option></select>
+    <div class="row" style="gap:4px">
+      <input id="explorerPath" value="/home/vcap/app" style="flex:1;font-size:11px">
+      <button id="btnLsRemote" class="btn-small">ls</button>
+      <button id="btnFindRemote" class="btn-small">Find</button>
+    </div>
+    <div class="row" style="gap:4px;margin-top:4px">
+      <input id="explorerQuery" placeholder="Grep query..." style="flex:1;font-size:11px">
+      <button id="btnGrepRemote" class="btn-small">Grep</button>
+    </div>
+    <div id="explorerOutput" class="server-info hidden"></div>
   </div>
 </div>
 
@@ -498,11 +603,19 @@ button:disabled{opacity:.4;cursor:default;transform:none;box-shadow:none}
     <input id="remoteRoot" value="/home/vcap/app" placeholder="/home/vcap/app">
     <label>SSH User (optional, for cf ssh)</label>
     <input id="sshUser" placeholder="cfuser" style="font-size:11px">
+    <label>Package Regex Filter (default)</label>
+    <input id="pkgRegexDefault" placeholder="e.g. ^@sap/" style="font-size:11px">
     <label>Folder Mappings</label>
     <div id="folderMappings"></div>
     <button id="btnAddMapping" class="btn-small btn-outline" style="margin-top:4px">+ Add Mapping</button>
     <button id="btnSaveSettings" class="btn-success" style="margin-top:8px">Save Settings</button>
     <div id="settingsStatus" class="server-info hidden"></div>
+  </div>
+  <div class="section-card">
+    <h3>CF Landscape Sync</h3>
+    <p style="font-size:11px;color:var(--text-muted);margin-bottom:6px">Sync all regions/orgs/spaces/apps to a local cache file (~/.cds-tool/cf-structure.json)</p>
+    <button id="btnSyncLandscape" class="btn-small">Start Sync</button>
+    <div id="syncStatus" class="server-info hidden"></div>
   </div>
   <div class="section-card">
     <h3>Cache</h3>
@@ -683,10 +796,63 @@ document.getElementById('btnBrowsePkg').addEventListener('click',function(){
   var app=document.getElementById('pkgAppSelect').value
   if(!app){aLog('warn','Select an app');return}
   var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  var filter=document.getElementById('pkgRegexFilter').value.trim()
   aLog('info','Browsing packages for '+app)
   document.getElementById('pkgList').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Listing packages...'
   document.getElementById('pkgList').classList.remove('hidden')
-  vscode.postMessage({type:'BROWSE_PACKAGES',payload:{appName:app,org:org,space:space}})
+  vscode.postMessage({type:'BROWSE_PACKAGES',payload:{appName:app,org:org,space:space,filter:filter}})
+})
+
+document.getElementById('btnGetToken').addEventListener('click',function(){
+  var app=document.getElementById('xsuaaAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  aLog('info','Getting XSUAA token for '+app)
+  document.getElementById('tokenStatus').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Getting token...'
+  document.getElementById('tokenStatus').classList.remove('hidden')
+  vscode.postMessage({type:'GET_XSUAA_TOKEN',payload:{appName:app,org:org,space:space}})
+})
+
+document.getElementById('btnShowWatchdog').addEventListener('click',function(){
+  vscode.postMessage({type:'SHOW_WATCHDOG'})
+})
+
+document.getElementById('btnSyncLandscape').addEventListener('click',function(){
+  var status=document.getElementById('syncStatus')
+  status.classList.remove('hidden')
+  status.innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Starting sync...'
+  vscode.postMessage({type:'SYNC_LANDSCAPE'})
+})
+
+document.getElementById('btnLsRemote').addEventListener('click',function(){
+  var app=document.getElementById('explorerAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  var dir=document.getElementById('explorerPath').value.trim()||'/home/vcap/app'
+  document.getElementById('explorerOutput').classList.remove('hidden')
+  document.getElementById('explorerOutput').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Listing...'
+  vscode.postMessage({type:'EXPLORER_LS',payload:{appName:app,org:org,space:space,dir:dir}})
+})
+
+document.getElementById('btnFindRemote').addEventListener('click',function(){
+  var app=document.getElementById('explorerAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  var dir=document.getElementById('explorerPath').value.trim()||'/home/vcap/app'
+  document.getElementById('explorerOutput').classList.remove('hidden')
+  document.getElementById('explorerOutput').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Finding...'
+  vscode.postMessage({type:'EXPLORER_FIND',payload:{appName:app,org:org,space:space,dir:dir,query:'*.js'}})
+})
+
+document.getElementById('btnGrepRemote').addEventListener('click',function(){
+  var app=document.getElementById('explorerAppSelect').value
+  if(!app){aLog('warn','Select an app');return}
+  var org=document.getElementById('orgSelect').value,space=document.getElementById('spaceSelect').value
+  var query=document.getElementById('explorerQuery').value.trim()
+  if(!query){aLog('warn','Enter a grep query');return}
+  document.getElementById('explorerOutput').classList.remove('hidden')
+  document.getElementById('explorerOutput').innerHTML='<span class="spinner" style="display:inline-block;margin-right:4px"></span> Grepping...'
+  vscode.postMessage({type:'EXPLORER_GREP',payload:{appName:app,org:org,space:space,query:query}})
 })
 
 window.addEventListener('message',function(e){
@@ -725,6 +891,8 @@ window.addEventListener('message',function(e){
       populateSelect('logAppSelect',apps)
       populateSelect('dbAppSelect',apps)
       populateSelect('pkgAppSelect',apps)
+      populateSelect('xsuaaAppSelect',apps)
+      populateSelect('explorerAppSelect',apps)
       aLog(msg.payload.fromCache?'info':'ok','Loaded '+apps.length+' app(s)'+(msg.payload.fromCache?' (from cache)':''))
       break
     case 'APPS_ERROR':
@@ -882,8 +1050,83 @@ window.addEventListener('message',function(e){
       document.getElementById('dbInfo').innerHTML='<span style="color:var(--error)">'+esc(msg.payload.message)+'</span>'
       aLog('err',msg.payload.message)
       break
+
+    case 'XSUAA_TOKEN_RESPONSE':{
+      var ts=document.getElementById('tokenStatus')
+      if(msg.payload.token){
+        navigator.clipboard.writeText(msg.payload.token)
+        ts.innerHTML='<span style="color:var(--success)">Token copied to clipboard (expires in '+msg.payload.expiresIn+'s)</span>'
+        aLog('ok','XSUAA token copied to clipboard')
+      }else{
+        ts.innerHTML='<span style="color:var(--error)">'+esc(msg.payload.error)+'</span>'
+        aLog('err','XSUAA token error: '+msg.payload.error)
+      }
+      break
+    }
+
+    case 'WATCHDOG_UPDATE':{
+      var wd=document.getElementById('watchdogStatus')
+      var apps=msg.payload.apps||[]
+      if(apps.length){
+        var failed=apps.filter(function(a){return a.failed})
+        wd.innerHTML=failed.length
+          ? '<span style="color:var(--error)">&#9679; '+failed.length+'/'+apps.length+' app(s) not responding</span>'
+          : '<span style="color:var(--success)">&#9679; '+apps.length+' app(s) healthy</span>'
+      }else{wd.textContent='No apps watched'}
+      break
+    }
+
+    case 'SYNC_STATUS':{
+      var ss=document.getElementById('syncStatus')
+      ss.innerHTML=msg.payload.message
+      break
+    }
+
+    case 'EXPLORER_RESULT':{
+      var eo=document.getElementById('explorerOutput')
+      if(msg.payload.error){
+        eo.innerHTML='<span style="color:var(--error)">'+esc(msg.payload.error)+'</span>'
+      }else{
+        eo.innerHTML=msg.payload.result.map(function(l){return '<div style="font-size:10px;line-height:1.4;white-space:pre-wrap;overflow-x:auto">'+esc(l)+'</div>'}).join('')
+      }
+      break
+    }
+
   }
 })
+
+var REGIONS_CATALOG=[
+  {key:'cf-ap10',label:'Australia',api:'https://api.cf.ap10.hana.ondemand.com'},
+  {key:'cf-ap11',label:'Singapore',api:'https://api.cf.ap11.hana.ondemand.com'},
+  {key:'cf-ap12',label:'Mumbai',api:'https://api.cf.ap12.hana.ondemand.com'},
+  {key:'cf-br10',label:'São Paulo',api:'https://api.cf.br10.hana.ondemand.com'},
+  {key:'cf-ca10',label:'Montreal',api:'https://api.cf.ca10.hana.ondemand.com'},
+  {key:'cf-eu10',label:'Frankfurt',api:'https://api.cf.eu10.hana.ondemand.com'},
+  {key:'cf-eu11',label:'London',api:'https://api.cf.eu11.hana.ondemand.com'},
+  {key:'cf-eu20',label:'Amsterdam',api:'https://api.cf.eu20.hana.ondemand.com'},
+  {key:'cf-in30',label:'Hyderabad',api:'https://api.cf.in30.hana.ondemand.com'},
+  {key:'cf-jp10',label:'Tokyo',api:'https://api.cf.jp10.hana.ondemand.com'},
+  {key:'cf-us10',label:'US East',api:'https://api.cf.us10.hana.ondemand.com'},
+  {key:'cf-us20',label:'US West',api:'https://api.cf.us20.hana.ondemand.com'},
+  {key:'cf-us30',label:'US Central',api:'https://api.cf.us30.hana.ondemand.com'},
+  {key:'cf-ch20',label:'Zurich',api:'https://api.cf.ch20.hana.ondemand.com'},
+]
+
+function buildRegionGrid(){
+  var grid=document.getElementById('regionGrid')
+  grid.innerHTML=REGIONS_CATALOG.map(function(r){
+    return '<button class="btn-small region-btn" data-api="'+esc(r.api)+'" data-key="'+esc(r.key)+'" style="font-size:10px;padding:3px 4px;text-align:left;border:1px solid var(--border);background:var(--card);border-radius:4px;cursor:pointer;transition:background .1s">'+esc(r.label)+'</button>'
+  }).join('')
+  grid.querySelectorAll('.region-btn').forEach(function(b){
+    b.addEventListener('click',function(){
+      document.getElementById('apiEndpoint').value=this.getAttribute('data-api')
+      document.getElementById('regionSelect').value=''
+      document.querySelectorAll('.region-btn').forEach(function(x){x.style.borderColor='var(--border)'})
+      this.style.borderColor='var(--accent)'
+    })
+  })
+}
+buildRegionGrid()
 
 function showTab(name){
   document.querySelectorAll('[id^="tab-"]').forEach(function(t){t.classList.add('hidden')})

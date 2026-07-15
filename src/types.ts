@@ -36,6 +36,11 @@ export interface ExtensionConfig {
   remoteRoot: string
   knownEndpoints: string[]
   sshUser?: string
+  sharedConfig?: {
+    remoteRoot?: string
+    packageRegexFilter?: string
+    appFolderMappings?: { appName: string; folderName: string }[]
+  }
 }
 
 export interface DbCredentials {
@@ -65,9 +70,15 @@ export type WebviewMessage =
   | { type: 'LOG'; payload: { level: string; message: string } }
   | { type: 'LOAD_SETTINGS' }
   | { type: 'SAVE_SETTINGS'; payload: { remoteRoot: string; sshUser?: string; newEndpoint?: string } }
-  | { type: 'BROWSE_PACKAGES'; payload: { appName: string; org: string; space: string } }
+  | { type: 'BROWSE_PACKAGES'; payload: { appName: string; org: string; space: string; filter?: string } }
   | { type: 'BROWSE_FILE'; payload: { appName: string; path: string; org: string; space: string } }
   | { type: 'GENERATE_LAUNCH_CONFIG'; payload: { config: any; org: string; space: string; apiEndpoint: string } }
+  | { type: 'GET_XSUAA_TOKEN'; payload: { appName: string; org: string; space: string } }
+  | { type: 'SHOW_WATCHDOG' }
+  | { type: 'SYNC_LANDSCAPE' }
+  | { type: 'EXPLORER_LS'; payload: { appName: string; org: string; space: string; dir: string } }
+  | { type: 'EXPLORER_FIND'; payload: { appName: string; org: string; space: string; dir: string; query: string } }
+  | { type: 'EXPLORER_GREP'; payload: { appName: string; org: string; space: string; query: string } }
 
 export type ExtensionMessage =
   | { type: 'LOGIN_SUCCESS'; payload: { orgs: string[]; apiEndpoint: string } }
@@ -98,3 +109,7 @@ export type ExtensionMessage =
   | { type: 'SETTINGS_LOADED'; payload: { remoteRoot: string; sshUser?: string; folderMappings: OrgGroupMapping[] } }
   | { type: 'PACKAGES_LOADED'; payload: { appName: string; packages: string[]; error?: string } }
   | { type: 'FILE_CONTENT'; payload: { appName: string; path: string; content: string } }
+  | { type: 'XSUAA_TOKEN_RESPONSE'; payload: { token?: string; expiresIn?: number; error?: string } }
+  | { type: 'WATCHDOG_UPDATE'; payload: { apps: { appName: string; url: string; failed: boolean }[] } }
+  | { type: 'SYNC_STATUS'; payload: { message: string } }
+  | { type: 'EXPLORER_RESULT'; payload: { result?: string[]; error?: string } }

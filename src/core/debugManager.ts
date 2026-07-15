@@ -1,18 +1,25 @@
 import * as vscode from 'vscode'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
+import * as os from 'node:os'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { cfSshSignal, cfEnableSsh, cfRestart, cfTarget, cfSshEnabled } from './cfClient'
+import { watchApp, unwatchApp, startWatchdog } from './watchdog'
+
 const DEBUG_PREFIX = 'Debug: '
 const BASE_PORT = 9229
-const MAX_RETRIES = 3
 const PROBE_TIMEOUT = 60000
+const CF_HOME_BASE = path.join(os.homedir(), '.cds-tool', 'cf-homes')
 
 const processes = new Map<string, ChildProcess>()
 const ports = new Map<string, number>()
 const channels = new Map<string, vscode.OutputChannel>()
 const sessionStatus = new Map<string, string>()
+const sessionCfHome = new Map<string, string>()
 const spaceSshChecked = new Set<string>()
 export const events = new EventEmitter()
+let portCounter = 0
 
 function getShell(): string {
   return process.env.SHELL || '/bin/zsh'
@@ -22,8 +29,6 @@ function shellEscape(a: string): string {
   return `'${a.replace(/'/g, "'\\''")}'`
 }
 
-let portCounter = 0
-
 function nextPort(): number {
   portCounter++
   return BASE_PORT + portCounter - 1
@@ -32,7 +37,7 @@ function nextPort(): number {
 function killProc(child: ChildProcess): void {
   if (!child.pid) return
   if (process.platform !== 'win32') {
-    try { process.kill(-child.pid, 'SIGTERM'); return } catch { /* fallback */ }
+    try { process.kill(-child.pid, 'SIGTERM'); return } catch { }
   }
   try { child.kill('SIGTERM') } catch { child.kill() }
 }
@@ -47,6 +52,25 @@ export function getSessionStatus(app: string): string | undefined {
 
 export function getDebugPort(app: string): number | undefined {
   return ports.get(app)
+}
+
+function ensureCfHome(org: string, space: string): string {
+  const dir = path.join(CF_HOME_BASE, `${org}-${space}`.replace(/[^a-zA-Z0-9_-]/g, '_'))
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+function runWithCfHome(appName: string, cmd: string, args: string[], org: string, space: string): ChildProcess {
+  const cfHome = ensureCfHome(org, space)
+  sessionCfHome.set(appName, cfHome)
+  const shell = getShell()
+  const fullCmd = 'cf ' + args.map(shellEscape).join(' ')
+  return spawn(shell, ['-l', '-c', fullCmd], {
+    cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '',
+    detached: process.platform !== 'win32',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, CF_HOME: cfHome },
+  })
 }
 
 export async function startDebugSession(
@@ -79,7 +103,6 @@ export async function startDebugSession(
   channel.appendLine(`[CDS Tool] Targeting ${org}/${space}...`)
   await cfTarget(org, space)
 
-  // Check space SSH before proceeding
   const spaceKey = `cf ${org}/${space}`
   if (!spaceSshChecked.has(spaceKey)) {
     channel.appendLine('[CDS Tool] Checking SSH access...')
@@ -111,11 +134,14 @@ export async function startDebugSession(
   emitStatus(appName, 'TUNNELING')
 
   const shell = getShell()
+  const cfHome = ensureCfHome(org, space)
+  sessionCfHome.set(appName, cfHome)
   const sCmd = 'cf ' + ['ssh', appName, '-L', tunnelArg, '-N'].map(shellEscape).join(' ')
   const child = spawn(shell, ['-l', '-c', sCmd], {
     cwd: folder,
     detached: process.platform !== 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, CF_HOME: cfHome },
   })
   processes.set(appName, child)
 
@@ -181,9 +207,26 @@ export async function startDebugSession(
     sessionStatus.set(appName, 'ATTACHED')
     emitStatus(appName, 'ATTACHED')
     vscode.window.showInformationMessage(`Debugger attached to ${appName}:${port}`)
+    startWatchdog()
+    const apps = await getAppUrls(appName, org, space)
+    if (apps?.urls?.length) {
+      for (const url of apps.urls) {
+        watchApp(appName, url)
+      }
+    }
   } else {
     sessionStatus.set(appName, 'ERROR')
     emitStatus(appName, 'ERROR')
+  }
+}
+
+async function getAppUrls(appName: string, org: string, space: string): Promise<{ urls: string[] } | null> {
+  try {
+    const { cfApps } = await import('./cfClient')
+    const apps = await cfApps(org, space)
+    return apps.find(a => a.name === appName) ?? null
+  } catch {
+    return null
   }
 }
 
@@ -206,16 +249,13 @@ async function ensureSshAccess(appName: string, ch: vscode.OutputChannel): Promi
 }
 
 async function signalInspector(appName: string, ch: vscode.OutputChannel): Promise<boolean> {
-  // Try multiple strategies to signal Node inspector
   const cmds = [
     `kill -USR1 $(pidof node 2>/dev/null | awk '{print $NF}') 2>/dev/null; kill -USR1 1 2>/dev/null; echo ok`,
     'kill -USR1 1',
   ]
-
   for (const cmd of cmds) {
     ch.appendLine(`[CDS Tool] Trying: cf ssh ${appName} -c "${cmd}"`)
     const result = await cfSshSignal(appName, cmd)
-
     if (result.stderr.toLowerCase().includes('ssh support is disabled')) {
       ch.appendLine('[CDS Tool] SSH disabled. Enabling...')
       try {
@@ -224,7 +264,6 @@ async function signalInspector(appName: string, ch: vscode.OutputChannel): Promi
         await cfRestart(appName)
         ch.appendLine('[CDS Tool] Waiting 20s for restart...')
         await sleep(20000)
-        // Retry after restart
         const retry = await cfSshSignal(appName, 'kill -USR1 1')
         return retry.code === 0
       } catch (err: any) {
@@ -232,10 +271,8 @@ async function signalInspector(appName: string, ch: vscode.OutputChannel): Promi
         return false
       }
     }
-
     if (result.code === 0) return true
   }
-
   return false
 }
 
@@ -247,7 +284,7 @@ async function writeLaunchConfig(workspacePath: string, configs: any[]): Promise
   let existing: any = { version: '0.2.0', configurations: [] }
   try {
     existing = JSON.parse(await fs.readFile(launchPath, 'utf8'))
-  } catch { /* file doesn't exist */ }
+  } catch { }
   const newNames = new Set(configs.map((c: any) => c.name))
   existing.configurations = [
     ...existing.configurations.filter((c: any) => !newNames.has(c.name)),
@@ -274,6 +311,7 @@ export async function stopDebugSession(appName: string): Promise<void> {
   }
 
   ports.delete(appName)
+  unwatchApp(appName)
 
   const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
   if (ws) {
@@ -285,7 +323,7 @@ export async function stopDebugSession(appName: string): Promise<void> {
       const json = JSON.parse(raw)
       json.configurations = json.configurations.filter((c: any) => c.name !== `${DEBUG_PREFIX}${appName}`)
       await fs.writeFile(launchPath, JSON.stringify(json, null, 2) + '\n')
-    } catch { /* ignore */ }
+    } catch { }
   }
 }
 
@@ -294,6 +332,7 @@ export async function stopAllDebugSessions(): Promise<void> {
   await Promise.allSettled(apps.map(a => stopDebugSession(a)))
   for (const ch of channels.values()) ch.dispose()
   channels.clear()
+  sessionCfHome.clear()
 }
 
 async function probePort(port: number, timeout: number): Promise<boolean> {
@@ -331,6 +370,7 @@ export function disposeDebugManager(): void {
   processes.clear()
   ports.clear()
   sessionStatus.clear()
+  sessionCfHome.clear()
   for (const ch of channels.values()) ch.dispose()
   channels.clear()
 }
