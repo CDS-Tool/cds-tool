@@ -409,6 +409,11 @@ document.getElementById('orgSelect').addEventListener('change',function(){
   vscode.postMessage({type:'LOAD_SPACES',payload:{org:org}})
 })
 
+document.getElementById('spaceSelect').addEventListener('change',function(){
+  var org=document.getElementById('orgSelect').value,space=this.value
+  if(org&&space){aLog('info','Loading apps for '+org+'/'+space+'...');vscode.postMessage({type:'LOAD_APPS',payload:{org:org,space:space}})}
+})
+
 document.getElementById('btnRefreshApps').addEventListener('click',function(){
   var org=document.getElementById('orgSelect').value
   var space=document.getElementById('spaceSelect').value
@@ -486,9 +491,15 @@ window.addEventListener('message',function(e){
       break
     case 'SPACES_LOADED':{
       var sel=document.getElementById('spaceSelect')
-      sel.innerHTML='<option value="">Select space...</option>'+msg.payload.spaces.map(function(s){return '<option value="'+esc(s)+'">'+esc(s)+'</option>'}).join('')
-      aLog('ok','Loaded '+msg.payload.spaces.length+' space(s)')
-      loadApps()
+      var spaces=msg.payload.spaces
+      sel.innerHTML='<option value="">Select space...</option>'+spaces.map(function(s){return '<option value="'+esc(s)+'">'+esc(s)+'</option>'}).join('')
+      aLog('ok','Loaded '+spaces.length+' space(s)')
+      if(spaces.length==1){
+        sel.value=spaces[0]
+        var org=document.getElementById('orgSelect').value
+        aLog('info','Loading apps for '+org+'/'+spaces[0]+'...')
+        vscode.postMessage({type:'LOAD_APPS',payload:{org:org,space:spaces[0]}})
+      }
       break
     }
     case 'APPS_LOADED':
